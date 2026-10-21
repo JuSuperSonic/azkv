@@ -1,0 +1,18 @@
+[package]
+name = "azkv-tui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "azkv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+azkv-core = { path = "../azkv-core" }
+clap = { workspace = true }
+ratatui = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

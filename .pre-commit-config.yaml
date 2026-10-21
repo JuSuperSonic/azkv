@@ -1,0 +1,25 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: format
+        name: Cargo Format
+        entry: cargo fmt
+        language: system
+        pass_filenames: false
+      - id: clippy
+        name: Cargo Clippy
+        entry: cargo clippy --all-targets --all-features --locked -- -D warnings
+        language: rust
+        pass_filenames: false
+      - id: check
+        name: Cargo Check
+        entry: cargo check
+        language: rust
+        pass_filenames: false
