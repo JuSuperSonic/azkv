@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use azkv_core::arm::Arm;
-use azkv_core::copy::{DEFAULT_CONCURRENCY, execute_copy, make_plan};
+use azkv_core::copy::{DEFAULT_CONCURRENCY, execute_copy, plan};
 use azkv_core::credential::AzAuth;
 use azkv_core::vault::KvVault;
 use azkv_core::{Profile, ProxySettings, Secret, SecretMeta, SecretStore, clipboard, is_not_found};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::{Action, Msg};
+use crate::app::{Action, Msg, matches};
 use crate::error::short;
 
 pub type AuthCache = HashMap<PathBuf, Arc<AzAuth>>;
@@ -96,15 +96,17 @@ pub fn execute(
                 let _ = tx.send(Msg::Refreshed { url: vault.url, name, result });
             });
         },
-        Action::SaveSecret { profile, vault, secret, updated } => {
+        Action::SaveSecret { profile, vault, secret, updated, patch } => {
             let auth = auth_for(&profile, auths);
             let tx = tx.clone();
             tokio::spawn(async move {
                 let result = match KvVault::for_vault(&vault, &auth, proxy.as_ref()) {
-                    Ok(client) => save_secret(&client, &secret, updated).await.map_err(short),
+                    Ok(client) => save_secret(&client, &secret, updated, patch).await.map_err(short),
                     Err(err) => Err(short(err)),
                 };
-                let _ = tx.send(Msg::Saved { url: vault.url, name: secret.name, value: secret.value, result });
+                // An attributes-only save never read the value.
+                let value = (!patch).then(|| secret.value.clone());
+                let _ = tx.send(Msg::Saved { url: vault.url, name: secret.name, value, result });
             });
         },
         Action::LoadVaultInfo { profile, vault } => {
@@ -127,6 +129,13 @@ pub fn execute(
                     Err(err) => Err(short(err)),
                 };
                 let _ = tx.send(Msg::CopyVaults { subscription_id: subscription.id, result });
+            });
+        },
+        Action::CheckProxy { proxy } => {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = proxy.check().await.map_err(short);
+                let _ = tx.send(Msg::ProxyChecked { proxy, result });
             });
         },
         Action::DuplicateSecret { profile, vault, source, name } => {
@@ -171,7 +180,7 @@ pub fn execute(
                 }
             });
         },
-        Action::CopyVault { profile, source, dest } => {
+        Action::CopyVault { profile, source, dest, filter } => {
             let auth = auth_for(&profile, auths);
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -180,7 +189,16 @@ pub fn execute(
                 let result = async {
                     let source_client = KvVault::for_vault(&source, &auth, proxy.as_ref())?;
                     let dest_client = KvVault::for_vault(&dest, &auth, proxy.as_ref())?;
-                    let plan = make_plan(&source_client, &dest_client, false).await?;
+                    // Only names matching the secret filter are planned; the
+                    // destination check still runs against that subset.
+                    let names = source_client
+                        .names()
+                        .await?
+                        .into_iter()
+                        .filter(|name| matches(name, &filter))
+                        .collect::<Vec<_>>();
+                    let existing = dest_client.names().await?.into_iter().collect();
+                    let plan = plan(&names, &existing, false);
                     Ok::<_, anyhow::Error>(execute_copy(&source_client, &dest_client, &plan, DEFAULT_CONCURRENCY).await)
                 }
                 .await
@@ -213,12 +231,26 @@ async fn check_and_copy(
 }
 
 /// Writes a secret after checking that a create is new or an edit is still current.
-async fn save_secret(client: &KvVault, secret: &Secret, updated: Option<Option<i128>>) -> Result<SecretMeta> {
+async fn save_secret(
+    client: &KvVault,
+    secret: &Secret,
+    updated: Option<Option<i128>>,
+    patch: bool,
+) -> Result<SecretMeta> {
     match updated {
         None => match client.get(&secret.name).await {
             Ok(_) => bail!("secret '{}' already exists", secret.name),
             Err(err) if is_not_found(&err) => {},
             Err(err) => return Err(err.into()),
+        },
+        // Disabled secrets cannot be read, so compare the listed metadata.
+        Some(expected) if patch => {
+            let Some(meta) = client.meta_of(&secret.name).await? else {
+                bail!("secret '{}' not found", secret.name);
+            };
+            if meta.updated.map(|updated| updated.unix_timestamp_nanos()) != expected {
+                bail!("secret '{}' changed since it was opened; close and reopen the editor", secret.name);
+            }
         },
         Some(expected) => {
             let (meta, _) = client.refresh(&secret.name).await?;
@@ -227,7 +259,7 @@ async fn save_secret(client: &KvVault, secret: &Secret, updated: Option<Option<i
             }
         },
     }
-    Ok(client.put(secret).await?)
+    if patch { Ok(client.update(secret).await?) } else { Ok(client.put(secret).await?) }
 }
 
 /// Copies a secret's value/metadata under a new name, refusing to overwrite.

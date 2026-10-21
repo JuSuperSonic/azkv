@@ -114,3 +114,6 @@ $RECYCLE.BIN/
 
 # Project
 *.sql
+
+# Graphify graph.
+graphify-out

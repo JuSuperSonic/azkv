@@ -5,6 +5,7 @@ use azure_core::credentials::TokenCredential;
 use azure_core::http::Transport;
 use azure_security_keyvault_secrets::models::{
     Secret as SecretModel, SecretClientGetSecretOptions, SecretProperties, SetSecretParameters,
+    UpdateSecretPropertiesParameters,
 };
 use azure_security_keyvault_secrets::{ResourceExt, SecretClient, SecretClientOptions};
 use futures::TryStreamExt;
@@ -74,6 +75,26 @@ impl KvVault {
             .map_err(|err| Error::from_azure(err, &context))?;
         let value = model.value.take().unwrap_or_default();
         Ok((meta_from_written(name, model), value))
+    }
+
+    /// Updates tags and attributes without touching the value. This is the only
+    /// way to change a secret while it is disabled.
+    pub async fn update(&self, secret: &Secret) -> Result<SecretMeta> {
+        let context = format!("cannot update secret '{}'", secret.name);
+        let parameters = update_parameters(secret).try_into().map_err(|err| Error::from_azure(err, &context))?;
+        let model = self
+            .client
+            .update_secret_properties(&secret.name, parameters, None)
+            .await
+            .map_err(|err| Error::from_azure(err, &context))?
+            .into_model()
+            .map_err(|err| Error::from_azure(err, &context))?;
+        Ok(meta_from_written(&secret.name, model))
+    }
+
+    /// Metadata of one secret; unlike `refresh`, this works when it is disabled.
+    pub async fn meta_of(&self, name: &str) -> Result<Option<SecretMeta>> {
+        Ok(self.meta().await?.into_iter().find(|secret| secret.name == name))
     }
 
     /// Deletes a secret (soft delete: recoverable from the vault).
@@ -186,6 +207,22 @@ pub fn set_parameters(secret: &Secret) -> SetSecretParameters {
     }
 }
 
+/// Attributes-only payload: no value, so a disabled secret can be re-enabled.
+pub fn update_parameters(secret: &Secret) -> UpdateSecretPropertiesParameters {
+    let attributes = azure_security_keyvault_secrets::models::SecretAttributes {
+        enabled: Some(secret.enabled),
+        expires: secret.expires,
+        not_before: secret.not_before,
+        ..Default::default()
+    };
+    UpdateSecretPropertiesParameters {
+        content_type: secret.content_type.clone(),
+        secret_attributes: Some(attributes),
+        // An empty map clears tags; `None` would leave them untouched.
+        tags: Some(secret.tags.iter().map(|(key, value)| (key.clone(), value.clone())).collect()),
+    }
+}
+
 fn to_btree(tags: Option<std::collections::HashMap<String, String>>) -> BTreeMap<String, String> {
     tags.unwrap_or_default().into_iter().collect()
 }
@@ -266,6 +303,15 @@ mod tests {
         let attributes = params.secret_attributes.unwrap();
         assert_eq!(attributes.enabled, Some(false));
         assert!(attributes.expires.is_none());
+    }
+
+    #[test]
+    fn update_parameters_omit_the_value() {
+        let source = secret("api-key", "s3cr3t");
+        let params = update_parameters(&source);
+        assert_eq!(params.secret_attributes.as_ref().and_then(|attributes| attributes.enabled), Some(true));
+        assert_eq!(params.tags.as_ref().and_then(|tags| tags.get("env")).map(String::as_str), Some("prod"));
+        assert_eq!(params.content_type.as_deref(), Some("text/plain"));
     }
 
     #[test]

@@ -11,6 +11,8 @@ pub enum Remote {
     Forbidden,
     /// 403 caused by the vault firewall, not by missing roles.
     Firewall,
+    /// 403 because the secret itself is disabled.
+    Disabled,
     Throttled,
     /// 409 because the secret is soft-deleted and its name is still reserved.
     SoftDeleted,
@@ -112,7 +114,11 @@ fn classify(status: u16, message: &str) -> Remote {
         return Remote::Unauthorized;
     }
     if status == 403 {
-        let firewall = message.to_ascii_lowercase().contains("client address is not authorized");
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("disabled secret") {
+            return Remote::Disabled;
+        }
+        let firewall = lower.contains("client address is not authorized");
         return if firewall { Remote::Firewall } else { Remote::Forbidden };
     }
     if status == 409 && is_soft_deleted(message) {
@@ -179,6 +185,13 @@ mod tests {
         assert_eq!(kind(500), Remote::Unavailable);
         assert_eq!(kind(502), Remote::Unavailable);
         assert_eq!(kind(418), Remote::Other);
+    }
+
+    #[test]
+    fn disabled_secret_denials_are_distinguished_from_role_denials() {
+        let disabled = classify(403, "Forbidden: Operation get is not allowed on a disabled secret.");
+        assert_eq!(disabled, Remote::Disabled);
+        assert_eq!(classify(403, "Forbidden"), Remote::Forbidden);
     }
 
     #[test]

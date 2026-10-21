@@ -1,0 +1,93 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/yamllint.json
+extends: default
+
+rules:
+  # Allow longer lines common in Kubernetes manifests
+  line-length:
+    max: 120
+    level: error
+
+  # Indentation: 2 spaces (Kubernetes standard)
+  indentation:
+    spaces: 2
+    indent-sequences: true
+    check-multi-line-strings: false
+
+  # Allow duplicate keys (needed for Helm templates with conditionals)
+  key-duplicates:
+    forbid-duplicated-merge-keys: true
+
+  # Relax trailing spaces (common in multi-line strings)
+  trailing-spaces:
+    level: error
+
+  # Comments configuration
+  comments:
+    min-spaces-from-content: 1
+    require-starting-space: true
+    ignore-shebangs: true
+
+  # Allow empty values (common in Kubernetes for optional fields)
+  empty-values:
+    forbid-in-block-mappings: false
+    forbid-in-flow-mappings: false
+
+  # Truthy values - be lenient with yes/no, on/off, true/false
+  truthy:
+    allowed-values: ["true", "false", "yes", "no", "on", "off"]
+    check-keys: false
+
+  # Brackets - consistent spacing
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+    min-spaces-inside-empty: 0
+    max-spaces-inside-empty: 0
+
+  # Braces - consistent spacing
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 0
+    min-spaces-inside-empty: 0
+    max-spaces-inside-empty: 0
+
+  # Colons - spacing after colons
+  colons:
+    max-spaces-before: 0
+    max-spaces-after: 1
+
+  # Commas - spacing after commas
+  commas:
+    max-spaces-before: 0
+    min-spaces-after: 1
+    max-spaces-after: 1
+
+  # Hyphens - spacing for list items
+  hyphens:
+    max-spaces-after: 1
+
+  # Document start/end markers
+  document-start:
+    present: true
+
+  document-end:
+    present: false
+
+  # Allow octal values (sometimes needed in Kubernetes for file modes)
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: false
+
+  # Quoted strings - allow both single and double quotes
+  quoted-strings:
+    quote-type: double
+    required: false
+
+# Ignore patterns for Helm-specific files
+ignore: |
+  .git/
+  .github/
+  .venv/
+  *.gotmpl
+  */templates/*.tpl

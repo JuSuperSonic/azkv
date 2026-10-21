@@ -13,15 +13,28 @@ pub(super) fn draw_picker(frame: &mut Frame, picker: &Picker) {
     let area = centered(frame.area());
     frame.render_widget(Clear, area);
     let height = area.height.saturating_sub(2) as usize;
+    let visible = picker.visible();
     let offset = picker.selected.saturating_sub(height.saturating_sub(1));
-    let items: Vec<ListItem> =
-        picker.items.iter().skip(offset).take(height).map(|item| ListItem::new(item.clone())).collect();
+    let items: Vec<ListItem> = visible
+        .iter()
+        .skip(offset)
+        .take(height)
+        .filter_map(|index| picker.items.get(*index))
+        .map(|item| ListItem::new(item.clone()))
+        .collect();
     let mut state = ListState::default();
     if !items.is_empty() {
         state.select(Some(picker.selected - offset));
     }
+    let title = if picker.filtering {
+        format!(" {} /{}_ ", picker.title, picker.filter)
+    } else if picker.filter.is_empty() {
+        format!(" {} ", picker.title)
+    } else {
+        format!(" {} [{}] ", picker.title, picker.filter)
+    };
     let list = List::new(items)
-        .block(Block::bordered().title(format!(" {} ", picker.title)).border_style(Style::new().fg(ACCENT)))
+        .block(Block::bordered().title(title).border_style(Style::new().fg(ACCENT)))
         .highlight_style(selection_style())
         .highlight_symbol("› ");
     frame.render_stateful_widget(list, area, &mut state);

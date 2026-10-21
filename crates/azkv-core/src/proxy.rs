@@ -51,6 +51,17 @@ impl ProxySettings {
         Ok(Some(Self { proxy: proxy_url, no_proxy, client }))
     }
 
+    pub async fn check(&self) -> Result<()> {
+        const PROBE: &str = "https://management.azure.com/metadata/endpoints?api-version=2020-09-01";
+        self.client
+            .get(PROBE)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map(|_| ())
+            .map_err(|err| Error::connect(&err, Some(&self.display_url()), "management.azure.com"))
+    }
+
     pub fn url(&self) -> &str {
         &self.proxy
     }
@@ -92,6 +103,13 @@ impl ProxySettings {
         }
         let client = Self::shared_client()?;
         Ok(Arc::clone(SHARED_TRANSPORT.get_or_init(|| Arc::new(client))))
+    }
+}
+
+/// Settings are equal when they describe the same proxy and bypass list.
+impl PartialEq for ProxySettings {
+    fn eq(&self, other: &Self) -> bool {
+        self.proxy == other.proxy && self.no_proxy == other.no_proxy
     }
 }
 
@@ -146,6 +164,15 @@ mod tests {
         let first = ProxySettings::shared_transport().unwrap();
         let second = ProxySettings::shared_transport().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test]
+    async fn check_fails_when_the_proxy_is_not_listening() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let settings = ProxySettings::new(Some(&format!("socks5h://127.0.0.1:{port}")), None).unwrap().unwrap();
+        assert!(settings.check().await.is_err());
     }
 
     #[test]
