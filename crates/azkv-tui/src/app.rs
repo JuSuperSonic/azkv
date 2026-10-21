@@ -23,10 +23,12 @@ pub enum Action {
     Copy(String),
     // `None` creates (checking the remote name); `Some(updated)` edits and
     // refuses if the remote secret changed since it was opened.
-    SaveSecret { profile: Profile, vault: Vault, secret: Secret, updated: Option<Option<i128>> },
+    // `patch` updates attributes without the value, so a disabled secret can be re-enabled.
+    SaveSecret { profile: Profile, vault: Vault, secret: Secret, updated: Option<Option<i128>>, patch: bool },
     LoadCopyVaults { profile: Profile, subscription: Subscription },
+    CheckProxy { proxy: ProxySettings },
     CopyToVault { profile: Profile, dest: Vault, secret: Secret, overwrite: bool },
-    CopyVault { profile: Profile, source: Vault, dest: Vault },
+    CopyVault { profile: Profile, source: Vault, dest: Vault, filter: String },
     LoadVaultInfo { profile: Profile, vault: Vault },
     DuplicateSecret { profile: Profile, vault: Vault, source: String, name: String },
     DeleteSecret { profile: Profile, vault: Vault, name: String },
@@ -43,8 +45,9 @@ pub enum Msg {
     Refreshed { url: String, name: String, result: Result<(SecretMeta, String), String> },
     Copied(Result<(), String>),
     Resize,
-    Saved { url: String, name: String, value: String, result: Result<SecretMeta, String> },
+    Saved { url: String, name: String, value: Option<String>, result: Result<SecretMeta, String> },
     CopyVaults { subscription_id: String, result: Result<Vec<Vault>, String> },
+    ProxyChecked { proxy: ProxySettings, result: Result<(), String> },
     CopyToExists { dest: Vault, secret: Secret },
     CopiedTo { dest: String, name: String, result: Result<(), String> },
     CopiedVault { source: String, dest: String, result: Result<azkv_core::copy::CopyReport, String> },
@@ -75,7 +78,23 @@ pub struct Picker {
     pub items: Vec<String>,
     /// `None` only for the "All tenants" entry.
     pub values: Vec<Option<usize>>,
+    /// Index into [`Picker::visible`], not into `items`.
     pub selected: usize,
+    /// `/` filter; empty shows every item. `matches` supports `|` for OR.
+    pub filter: String,
+    pub filtering: bool,
+}
+
+impl Picker {
+    pub(crate) fn visible(&self) -> Vec<usize> {
+        (0..self.items.len()).filter(|index| matches(&self.items[*index], &self.filter)).collect()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldKind {
+    Text,
+    Date,
 }
 
 #[derive(Clone)]
@@ -84,14 +103,26 @@ pub struct EditField {
     value: Vec<char>,
     cursor: usize,
     dirty: bool,
-    /// Set when focus lands on the field; the first edit replaces the value.
     selected: bool,
+    kind: FieldKind,
 }
 
 impl EditField {
     fn new(label: &'static str, text: &str) -> Self {
+        Self::with_kind(label, text, FieldKind::Text)
+    }
+
+    fn date(label: &'static str, text: &str) -> Self {
+        Self::with_kind(label, text, FieldKind::Date)
+    }
+
+    fn with_kind(label: &'static str, text: &str, kind: FieldKind) -> Self {
         let value: Vec<char> = text.chars().collect();
-        Self { label, cursor: value.len(), value, dirty: false, selected: false }
+        Self { label, cursor: value.len(), value, dirty: false, selected: false, kind }
+    }
+
+    pub fn placeholder(&self) -> Option<&'static str> {
+        (self.kind == FieldKind::Date && self.value.is_empty()).then_some("____-__-__")
     }
 
     pub fn display(&self) -> String {
@@ -127,6 +158,17 @@ impl EditField {
     }
 
     fn insert(&mut self, character: char) {
+        if self.kind == FieldKind::Date {
+            if character.is_ascii_digit() {
+                if self.selected {
+                    self.value.clear();
+                    self.cursor = 0;
+                    self.selected = false;
+                }
+                self.insert_date_digit(character);
+            }
+            return;
+        }
         if self.selected {
             self.replace(character);
             return;
@@ -138,6 +180,25 @@ impl EditField {
 
     /// Inserts pasted text as-is, replacing a selected value first.
     fn insert_text(&mut self, text: &str) {
+        if self.kind == FieldKind::Date {
+            let pasted: Vec<char> = text.chars().filter(|character| character.is_ascii_digit()).collect();
+            if pasted.is_empty() {
+                return;
+            }
+            if self.selected {
+                self.value.clear();
+                self.cursor = 0;
+                self.selected = false;
+            }
+            let mut digits = self.date_digits();
+            let start = self.digit_index();
+            let room = 8usize.saturating_sub(digits.len());
+            for (offset, character) in pasted.into_iter().take(room).enumerate() {
+                digits.insert(start + offset, character);
+            }
+            self.set_date_digits(&digits);
+            return;
+        }
         if self.selected {
             self.value.clear();
             self.cursor = 0;
@@ -158,6 +219,23 @@ impl EditField {
     }
 
     fn backspace(&mut self) {
+        if self.kind == FieldKind::Date {
+            if self.selected {
+                self.value.clear();
+                self.cursor = 0;
+                self.selected = false;
+                self.dirty = true;
+                return;
+            }
+            let at = self.digit_index();
+            if at == 0 {
+                return;
+            }
+            let mut digits = self.date_digits();
+            digits.remove(at - 1);
+            self.set_date_digits(&digits);
+            return;
+        }
         if self.selected {
             self.value.clear();
             self.cursor = 0;
@@ -171,6 +249,23 @@ impl EditField {
     }
 
     fn delete(&mut self) {
+        if self.kind == FieldKind::Date {
+            if self.selected {
+                self.value.clear();
+                self.cursor = 0;
+                self.selected = false;
+                self.dirty = true;
+                return;
+            }
+            let at = self.digit_index();
+            let mut digits = self.date_digits();
+            if at >= digits.len() {
+                return;
+            }
+            digits.remove(at);
+            self.set_date_digits(&digits);
+            return;
+        }
         if self.selected {
             self.value.clear();
             self.cursor = 0;
@@ -180,6 +275,40 @@ impl EditField {
             self.value.remove(self.cursor);
             self.dirty = true;
         }
+    }
+
+    fn date_digits(&self) -> Vec<char> {
+        self.value.iter().copied().filter(|character| character.is_ascii_digit()).collect()
+    }
+
+    /// Number of digits before the cursor, i.e. the insert position.
+    fn digit_index(&self) -> usize {
+        self.value[..self.cursor.min(self.value.len())].iter().filter(|character| character.is_ascii_digit()).count()
+    }
+
+    fn insert_date_digit(&mut self, character: char) {
+        let mut digits = self.date_digits();
+        if digits.len() == 8 {
+            return;
+        }
+        let at = self.digit_index();
+        digits.insert(at, character);
+        self.set_date_digits(&digits);
+    }
+
+    /// Rewrites `digits` as `YYYY-MM-DD` with dashes after the 4th and 6th digit.
+    fn set_date_digits(&mut self, digits: &[char]) {
+        let mut text = String::new();
+        for (index, digit) in digits.iter().enumerate() {
+            if index == 4 || index == 6 {
+                text.push('-');
+            }
+            text.push(*digit);
+        }
+        self.value = text.chars().collect();
+        let position = digits.len();
+        self.cursor = position + usize::from(position > 4) + usize::from(position > 6);
+        self.dirty = true;
     }
 }
 
@@ -192,6 +321,8 @@ pub struct Editor {
     /// Checkbox after the text fields; `space` toggles it.
     pub enabled: bool,
     pub active: usize,
+    /// True for a disabled secret: its value cannot be read or edited until enabled.
+    pub value_locked: bool,
     original_value: String,
     original_expires: Option<OffsetDateTime>,
     original_not_before: Option<OffsetDateTime>,
@@ -270,6 +401,8 @@ pub struct App {
     pub vault_state: ListState,
     pub secrets: Vec<SecretMeta>,
     pub secret_state: TableState,
+    pub vault_rows: usize,
+    pub secret_rows: usize,
     pub pane: Pane,
     pub vault_filter: String,
     pub secret_filter: String,
@@ -292,6 +425,7 @@ pub struct App {
     pub proxy: Option<ProxySettings>,
     last_proxy: Option<ProxySettings>,
     pub proxy_editor: Option<ProxyEditor>,
+    proxy_checking: bool,
     pub info_url: Option<String>,
     pub info_moved: bool,
     pub info: Option<Result<VaultInfo, String>>,
@@ -314,6 +448,8 @@ impl App {
             vault_state: ListState::default(),
             secrets: Vec::new(),
             secret_state: TableState::default(),
+            vault_rows: 10,
+            secret_rows: 9,
             pane: Pane::Vaults,
             vault_filter: String::new(),
             secret_filter: String::new(),
@@ -336,6 +472,7 @@ impl App {
             proxy: None,
             last_proxy: None,
             proxy_editor: None,
+            proxy_checking: false,
             info_url: None,
             info_moved: false,
             info: None,
@@ -594,6 +731,7 @@ impl App {
                 match result {
                     Ok(meta) => {
                         self.editor = None;
+                        let enabled = meta.enabled;
                         let existing = self.secrets.iter().position(|secret| secret.name == name);
                         match existing {
                             Some(index) => self.secrets[index] = meta,
@@ -608,10 +746,27 @@ impl App {
                                 }
                             },
                         }
-                        self.values.insert(name.clone(), Ok(value));
+                        let reload = match value {
+                            Some(value) => {
+                                self.values.insert(name.clone(), Ok(value));
+                                None
+                            },
+                            // Attributes-only save: the value was never read.
+                            None if enabled => {
+                                self.values.remove(&name);
+                                self.preview()
+                            },
+                            None => {
+                                self.values.insert(
+                                    name.clone(),
+                                    Err("secret is disabled — enable it to read or copy the value".into()),
+                                );
+                                None
+                            },
+                        };
                         self.status =
                             if existing.is_some() { format!("saved '{name}'") } else { format!("created '{name}'") };
-                        None
+                        reload
                     },
                     Err(err) => {
                         self.status = format!("save failed: {err}");
@@ -672,6 +827,23 @@ impl App {
                     },
                 }
                 None
+            },
+            Msg::ProxyChecked { proxy, result } => {
+                self.proxy_checking = false;
+                match result {
+                    Ok(()) => {
+                        let label = proxy.display_url();
+                        self.set_proxy(Some(proxy));
+                        self.proxy_editor = None;
+                        self.status = format!("proxy reachable: {label}");
+                        self.reload_after_proxy()
+                    },
+                    Err(err) => {
+                        // Keep the editor open so the address can be fixed.
+                        self.status = format!("proxy check failed: {err}");
+                        None
+                    },
+                }
             },
             Msg::CopyToExists { dest, secret } => {
                 self.status = format!("'{}' exists in {} - y overwrite, n cancel", secret.name, dest.name);
@@ -785,6 +957,11 @@ impl App {
                 let moved = self.move_selection(-1);
                 self.after_secret_move(moved)
             },
+            KeyCode::PageDown | KeyCode::PageUp => {
+                let step = self.page_step() * if key.code == KeyCode::PageDown { 1 } else { -1 };
+                let moved = self.move_selection(step);
+                self.after_secret_move(moved)
+            },
             KeyCode::Char('g') | KeyCode::Home => {
                 let moved = self.jump(false);
                 self.after_secret_move(moved)
@@ -832,12 +1009,11 @@ impl App {
                 self.open_proxy_editor();
                 None
             },
-            KeyCode::Char('C') => match self.pane {
-                Pane::Vaults => self.open_copy_vault(),
-                Pane::Secrets => self.open_copy(),
-            },
+            KeyCode::Char('C') if self.pane == Pane::Secrets => self.open_copy_vault(),
+            KeyCode::Char('V') if self.pane == Pane::Secrets => self.open_copy(),
             KeyCode::Char('c') => self.copy_value(),
             KeyCode::Char('y') => self.selected_secret().map(|secret| Action::Copy(secret.name.clone())),
+            KeyCode::Char('Y') if self.pane == Pane::Secrets => self.copy_names(),
             _ => None,
         }
     }
@@ -851,7 +1027,33 @@ impl App {
             return self.load_vaults();
         }
         let picker = self.picker.as_mut()?;
+        if picker.filtering {
+            match key.code {
+                KeyCode::Esc => {
+                    picker.filtering = false;
+                    picker.filter.clear();
+                    picker.selected = 0;
+                },
+                KeyCode::Enter => picker.filtering = false,
+                KeyCode::Backspace => {
+                    picker.filter.pop();
+                    picker.selected = 0;
+                },
+                KeyCode::Char(character) => {
+                    picker.filter.push(character);
+                    picker.selected = 0;
+                },
+                _ => {},
+            }
+            return None;
+        }
         match key.code {
+            KeyCode::Char('/') if picker.kind == PickerKind::Profiles => {
+                picker.filtering = true;
+                picker.filter.clear();
+                picker.selected = 0;
+                None
+            },
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.picker = None;
                 self.copy_source = None;
@@ -859,8 +1061,9 @@ impl App {
                 None
             },
             KeyCode::Down => {
+                let last = picker.visible().len().saturating_sub(1);
                 if !picker.items.is_empty() {
-                    picker.selected = (picker.selected + 1).min(picker.items.len() - 1);
+                    picker.selected = (picker.selected + 1).min(last);
                 }
                 None
             },
@@ -869,6 +1072,9 @@ impl App {
                 None
             },
             KeyCode::Enter => {
+                if self.picker.as_ref()?.visible().is_empty() {
+                    return None;
+                }
                 let picker = self.picker.take()?;
                 self.copy_refreshing = false;
                 self.apply_picker(picker)
@@ -878,7 +1084,8 @@ impl App {
     }
 
     fn apply_picker(&mut self, picker: Picker) -> Option<Action> {
-        let value = *picker.values.get(picker.selected)?;
+        let index = *picker.visible().get(picker.selected)?;
+        let value = *picker.values.get(index)?;
         match picker.kind {
             PickerKind::Profiles => {
                 self.profile_idx = value?;
@@ -954,6 +1161,8 @@ impl App {
             items,
             values,
             selected: self.profile_idx,
+            filter: String::new(),
+            filtering: false,
         });
     }
 
@@ -966,7 +1175,15 @@ impl App {
             values.push(Some(index));
         }
         let selected = self.tenant_idx.map(|index| index + 1).unwrap_or(0);
-        self.picker = Some(Picker { kind: PickerKind::Tenants, title: "tenants", items, values, selected });
+        self.picker = Some(Picker {
+            kind: PickerKind::Tenants,
+            title: "tenants",
+            items,
+            values,
+            selected,
+            filter: String::new(),
+            filtering: false,
+        });
     }
 
     fn open_subscription_picker(&mut self) {
@@ -983,6 +1200,8 @@ impl App {
             items,
             values,
             selected: self.sub_idx,
+            filter: String::new(),
+            filtering: false,
         });
     }
 
@@ -1001,6 +1220,13 @@ impl App {
                 self.revealed = false;
                 false
             },
+        }
+    }
+
+    fn page_step(&self) -> isize {
+        match self.pane {
+            Pane::Vaults => self.vault_rows.max(1) as isize,
+            Pane::Secrets => self.secret_rows.max(1) as isize,
         }
     }
 
@@ -1083,6 +1309,20 @@ impl App {
         let subscription = self.subscription()?;
         let vault = self.vault()?;
         Some(Action::FetchValue { profile, subscription, vault, name })
+    }
+
+    fn copy_names(&mut self) -> Option<Action> {
+        let names: Vec<&str> = self
+            .visible_secrets()
+            .into_iter()
+            .filter_map(|index| self.secrets.get(index))
+            .map(|s| s.name.as_str())
+            .collect();
+        if names.is_empty() {
+            self.status = "no secrets to copy".into();
+            return None;
+        }
+        Some(Action::Copy(names.join("\n")))
     }
 
     fn copy_value(&mut self) -> Option<Action> {
@@ -1194,17 +1434,22 @@ impl App {
     fn open_editor(&mut self) -> Option<Action> {
         let secret = self.selected_secret()?.clone();
         let name = secret.name.clone();
-        let value = match self.values.get(&name) {
-            Some(Ok(value)) => value.clone(),
-            Some(Err(err)) => {
-                self.status = format!("error: {err}");
-                return None;
-            },
-            None => {
-                self.pending_edit = Some(name);
-                self.status = "fetching value...".into();
-                return self.preview();
-            },
+        // A disabled secret cannot be read, so open it with a locked value.
+        let (value, locked) = if !secret.enabled {
+            (String::new(), true)
+        } else {
+            match self.values.get(&name) {
+                Some(Ok(value)) => (value.clone(), false),
+                Some(Err(err)) => {
+                    self.status = format!("error: {err}");
+                    return None;
+                },
+                None => {
+                    self.pending_edit = Some(name);
+                    self.status = "fetching value...".into();
+                    return self.preview();
+                },
+            }
         };
         self.editor = Some(Editor {
             secret: name,
@@ -1212,18 +1457,23 @@ impl App {
             fields: vec![
                 EditField::new("value", &value),
                 EditField::new("type", secret.content_type.as_deref().unwrap_or("")),
-                EditField::new("expires", &fmt_date(secret.expires)),
-                EditField::new("activates", &fmt_date(secret.not_before)),
+                EditField::date("expires", &fmt_date(secret.expires)),
+                EditField::date("activates", &fmt_date(secret.not_before)),
                 EditField::new("tags", &format_tags(&secret.tags)),
             ],
             enabled: secret.enabled,
             active: 0,
+            value_locked: locked,
             original_value: value,
             original_expires: secret.expires,
             original_not_before: secret.not_before,
             original_updated: secret.updated.map(|updated| updated.unix_timestamp_nanos()),
         });
-        self.status = "edit: tab/↑↓ next, enter save, esc cancel".into();
+        self.status = if locked {
+            "edit: secret disabled, enable it to edit the value".into()
+        } else {
+            "edit: tab/↑↓ next, enter save, esc cancel".into()
+        };
         None
     }
 
@@ -1238,12 +1488,13 @@ impl App {
             fields: vec![
                 EditField::new("value", ""),
                 EditField::new("type", ""),
-                EditField::new("expires", ""),
-                EditField::new("activates", ""),
+                EditField::date("expires", ""),
+                EditField::date("activates", ""),
                 EditField::new("tags", ""),
             ],
             enabled: true,
             active: 0,
+            value_locked: false,
             original_value: String::new(),
             original_expires: None,
             original_not_before: None,
@@ -1266,6 +1517,10 @@ impl App {
             editor.active = value_index;
         }
         let is_value = editor.active == value_index;
+        if is_value && editor.value_locked {
+            self.status = "value locked: enable the secret to edit it".into();
+            return;
+        }
         let text =
             if is_value { text.replace("\r\n", "\n").replace('\r', "\n") } else { text.replace(['\r', '\n'], " ") };
         if let Some(field) = editor.active_field_mut() {
@@ -1279,6 +1534,9 @@ impl App {
             return;
         };
         let value_index = usize::from(editor.name.is_some());
+        if editor.value_locked {
+            return;
+        }
         if editor.active == value_index
             && let Some(field) = editor.active_field_mut()
         {
@@ -1345,6 +1603,9 @@ impl App {
             _ => {},
         }
         let editor = self.editor.as_mut()?;
+        if editor.value_locked && editor.active == usize::from(editor.name.is_some()) {
+            return None;
+        }
         edit_field(editor.active_field_mut()?, key.code);
         None
     }
@@ -1430,6 +1691,10 @@ impl App {
     }
 
     fn on_proxy_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // The proxy check runs in the background; ignore edits until it answers.
+        if self.proxy_checking {
+            return None;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.proxy_editor = None;
@@ -1493,12 +1758,14 @@ impl App {
         };
         let no_proxy = self.last_proxy.as_ref().and_then(|proxy| proxy.no_proxy()).map(str::to_string);
         match ProxySettings::new(Some(&url), no_proxy.as_deref()) {
-            Ok(proxy) => {
-                let label = proxy.as_ref().map(ProxySettings::display_url).unwrap_or_else(|| url.clone());
-                self.set_proxy(proxy);
-                self.proxy_editor = None;
-                self.status = format!("proxy {label}");
-                self.reload_after_proxy()
+            Ok(Some(proxy)) => {
+                self.proxy_checking = true;
+                self.status = format!("checking proxy {}...", proxy.display_url());
+                Some(Action::CheckProxy { proxy })
+            },
+            Ok(None) => {
+                self.status = "proxy: address required".into();
+                None
             },
             Err(err) => {
                 self.status = format!("proxy: {err}");
@@ -1537,6 +1804,12 @@ impl App {
         } else {
             editor.original_not_before
         };
+        if let (Some(expires), Some(not_before)) = (expires, not_before)
+            && expires <= not_before
+        {
+            self.status = "expires: must be after activates".into();
+            return None;
+        }
         let content_type = {
             let text = editor.field(1).text();
             if text.trim().is_empty() { None } else { Some(text) }
@@ -1575,10 +1848,11 @@ impl App {
             let expected_updated = Some(editor.original_updated);
             (editor.secret.clone(), editor.value_for_save(), tags, editor.enabled, not_before, expected_updated)
         };
+        let patch = editor.value_locked;
         let secret = Secret { name, value, content_type, tags, enabled, expires, not_before };
         let profile = self.profile()?.clone();
         let vault = self.vault()?;
-        Some(Action::SaveSecret { profile, vault, secret, updated: expected_updated })
+        Some(Action::SaveSecret { profile, vault, secret, updated: expected_updated, patch })
     }
 
     fn open_copy(&mut self) -> Option<Action> {
@@ -1620,12 +1894,12 @@ impl App {
             items,
             values,
             selected: 0,
+            filter: String::new(),
+            filtering: false,
         });
         None
     }
 
-    /// The current subscription's vaults are already loaded in the panel, so
-    /// reuse them instead of fetching the same list again.
     fn select_copy_subscription(&mut self, subscription: Subscription) -> Option<Action> {
         self.copy_sub = Some(subscription.clone());
         if self.subscription().is_some_and(|current| current.id == subscription.id) {
@@ -1635,7 +1909,6 @@ impl App {
         self.load_copy_vaults(subscription)
     }
 
-    /// Rebuild the destination picker after refreshing the panel behind it.
     fn refresh_copy(&mut self) -> Option<Action> {
         let subscription = self.copy_sub.clone()?;
         if self.subscription().is_some_and(|current| current.id == subscription.id) {
@@ -1659,7 +1932,15 @@ impl App {
         let items =
             self.copy_vaults.iter().map(|vault| format!("{}  ({})", vault.name, vault.subscription_name)).collect();
         let values = (0..self.copy_vaults.len()).map(Some).collect();
-        self.picker = Some(Picker { kind: PickerKind::CopyVault, title: "copy to vault", items, values, selected: 0 });
+        self.picker = Some(Picker {
+            kind: PickerKind::CopyVault,
+            title: "copy to vault",
+            items,
+            values,
+            selected: 0,
+            filter: String::new(),
+            filtering: false,
+        });
     }
 
     fn load_copy_vaults(&mut self, subscription: Subscription) -> Option<Action> {
@@ -1708,8 +1989,13 @@ impl App {
         }
         let profile = self.profile()?.clone();
         self.loading = true;
-        self.status = format!("copying all secrets to {}...", dest.name);
-        Some(Action::CopyVault { profile, source, dest })
+        self.status = if self.secret_filter.is_empty() {
+            format!("copying all secrets to {}...", dest.name)
+        } else {
+            format!("copying secrets matching [{}] to {}...", self.secret_filter, dest.name)
+        };
+        let filter = self.secret_filter.clone();
+        Some(Action::CopyVault { profile, source, dest, filter })
     }
 
     fn on_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -1781,7 +2067,10 @@ fn other(pane: Pane) -> Pane {
 }
 
 pub fn matches(name: &str, filter: &str) -> bool {
-    filter.is_empty() || name.to_lowercase().contains(&filter.to_lowercase())
+    let name = name.to_lowercase();
+    let terms =
+        filter.split('|').map(|term| term.trim().to_lowercase()).filter(|term| !term.is_empty()).collect::<Vec<_>>();
+    terms.is_empty() || terms.iter().any(|term| name.contains(term))
 }
 
 fn format_tags(tags: &BTreeMap<String, String>) -> String {
@@ -1964,6 +2253,15 @@ mod tests {
         });
     }
 
+    /// Finishes the connectivity check that Enter starts, as the main loop would.
+    fn confirm_proxy(app: &mut App) -> Option<Action> {
+        let action = app.on_key(key(KeyCode::Enter));
+        let Some(Action::CheckProxy { proxy }) = action else {
+            panic!("expected CheckProxy, got {action:?}");
+        };
+        app.handle(Msg::ProxyChecked { proxy, result: Ok(()) })
+    }
+
     fn with_secrets(app: &mut App, names: &[&str]) {
         let url = app.vault().unwrap().url;
         app.handle(Msg::Secrets { url, result: Ok(names.iter().map(|name| meta(name)).collect()) });
@@ -2060,6 +2358,20 @@ mod tests {
     }
 
     #[test]
+    fn y_copies_every_visible_name() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["db-password", "db-user", "api-key"]);
+        app.pane = Pane::Secrets;
+        app.secret_filter = "db".into();
+        assert_eq!(app.on_key(key(KeyCode::Char('Y'))), Some(Action::Copy("db-password\ndb-user".into())));
+
+        app.secret_filter = "zz".into();
+        assert!(app.on_key(key(KeyCode::Char('Y'))).is_none());
+        assert_eq!(app.status, "no secrets to copy");
+    }
+
+    #[test]
     fn escape_clears_the_filter() {
         let mut app = loaded_app();
         with_vaults(&mut app);
@@ -2081,6 +2393,27 @@ mod tests {
         assert_eq!(app.vault_state.selected(), Some(1));
         app.on_key(key(KeyCode::Down));
         assert_eq!(app.vault_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn page_keys_jump_one_screenful() {
+        let mut app = loaded_app();
+        let subscription = app.subscription().unwrap();
+        let vaults = (0..5).map(|index| vault(&format!("kv-{index}"), &subscription)).collect();
+        app.handle(Msg::Vaults {
+            dir: app.profile().unwrap().dir.clone(),
+            subscription_id: subscription.id,
+            result: Ok(vaults),
+        });
+        app.pane = Pane::Vaults;
+        app.vault_rows = 2;
+
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.vault_state.selected(), Some(2));
+        app.on_key(key(KeyCode::PageDown));
+        assert_eq!(app.vault_state.selected(), Some(4));
+        app.on_key(key(KeyCode::PageUp));
+        assert_eq!(app.vault_state.selected(), Some(2));
     }
 
     #[test]
@@ -2155,6 +2488,42 @@ mod tests {
             Some(Action::LoadOverview { ref profile }) if profile.name == "coucou"
         ));
         assert!(app.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn profile_picker_filters_with_slash() {
+        let mut app = loaded_app();
+        app.on_key(key(KeyCode::Char('p')));
+        app.on_key(key(KeyCode::Char('/')));
+        assert!(app.picker.as_ref().unwrap().filtering);
+        for character in "cou".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        let picker = app.picker.as_ref().unwrap();
+        assert_eq!(picker.filter, "cou");
+        assert_eq!(picker.visible(), vec![1], "only the coucou profile is listed");
+        assert_eq!(picker.selected, 0);
+
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.picker.as_ref().is_some_and(|picker| !picker.filtering));
+        let action = app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.profile_idx, 1);
+        assert!(matches!(
+            action,
+            Some(Action::LoadOverview { ref profile }) if profile.name == "coucou"
+        ));
+    }
+
+    #[test]
+    fn picker_filter_escape_clears_but_keeps_the_picker() {
+        let mut app = loaded_app();
+        app.on_key(key(KeyCode::Char('p')));
+        app.on_key(key(KeyCode::Char('/')));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Esc));
+        let picker = app.picker.as_ref().unwrap();
+        assert!(!picker.filtering);
+        assert!(picker.filter.is_empty());
     }
 
     #[test]
@@ -2343,6 +2712,18 @@ mod tests {
     }
 
     #[test]
+    fn filters_support_pipe_alternatives() {
+        assert!(matches("db-password", "db|api"));
+        assert!(matches("api-key", "db|api"));
+        assert!(!matches("cache", "db|api"));
+        // Spaces around pipes and a trailing pipe (still typing) are tolerated.
+        assert!(matches("api-key", " db | api "));
+        assert!(matches("db-password", "db|"));
+        // A filter with no terms at all behaves like an empty filter.
+        assert!(matches("db-password", "|"));
+    }
+
+    #[test]
     fn resize_is_not_an_error_and_keeps_state() {
         let mut app = loaded_app();
         with_vaults(&mut app);
@@ -2408,6 +2789,58 @@ mod tests {
     }
 
     #[test]
+    fn disabled_secret_opens_a_locked_editor_and_saves_attributes() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+        app.secrets[0].enabled = false;
+        app.pane = Pane::Secrets;
+
+        assert!(app.on_key(key(KeyCode::Char('e'))).is_none());
+        let editor = app.editor.as_ref().expect("editor opens without fetching the value");
+        assert!(editor.value_locked);
+        assert!(!editor.enabled);
+        assert_eq!(editor.fields[0].text(), "");
+        assert!(app.status.contains("enable it to edit the value"));
+
+        // The locked value ignores typing and pasting.
+        app.on_key(key(KeyCode::Char('x')));
+        app.paste("secret");
+        assert_eq!(app.editor.as_ref().unwrap().fields[0].text(), "");
+
+        for _ in 0..5 {
+            app.on_key(key(KeyCode::Tab));
+        }
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(app.editor.as_ref().unwrap().enabled);
+
+        let action = app.on_key(key(KeyCode::Enter)).unwrap();
+        let Action::SaveSecret { secret, patch, .. } = action else {
+            panic!("expected SaveSecret, got {action:?}");
+        };
+        assert!(patch, "enabling uses an attributes-only save");
+        assert!(secret.enabled);
+    }
+
+    #[test]
+    fn attribute_only_save_drops_the_stale_value() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+        app.values.insert("alpha".into(), Ok("old".into()));
+        let url = app.vault().unwrap().url;
+
+        app.handle(Msg::Saved { url: url.clone(), name: "alpha".into(), value: None, result: Ok(meta("alpha")) });
+        assert!(!app.values.contains_key("alpha"), "the value must be fetched again");
+        assert!(app.secrets[0].enabled);
+
+        let mut disabled = meta("alpha");
+        disabled.enabled = false;
+        app.handle(Msg::Saved { url: url.clone(), name: "alpha".into(), value: None, result: Ok(disabled) });
+        assert!(matches!(app.values.get("alpha"), Some(Err(message)) if message.contains("disabled")));
+    }
+
+    #[test]
     fn editor_parses_an_activation_date() {
         let mut app = loaded_app();
         with_vaults(&mut app);
@@ -2419,9 +2852,10 @@ mod tests {
         app.on_key(key(KeyCode::Tab));
         app.on_key(key(KeyCode::Tab));
         assert_eq!(app.editor.as_ref().unwrap().active, 3);
-        for character in "2028-02-01".chars() {
+        for character in "20280201".chars() {
             app.on_key(key(KeyCode::Char(character)));
         }
+        assert_eq!(app.editor.as_ref().unwrap().fields[3].text(), "2028-02-01");
 
         let action = app.on_key(key(KeyCode::Enter)).unwrap();
         let Action::SaveSecret { secret, .. } = action else {
@@ -2751,7 +3185,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('a')));
         let url = app.vault().unwrap().url;
 
-        app.handle(Msg::Saved { url, name: "beta".into(), value: "v".into(), result: Ok(meta("beta")) });
+        app.handle(Msg::Saved { url, name: "beta".into(), value: Some("v".into()), result: Ok(meta("beta")) });
         assert!(app.editor.is_none());
         assert_eq!(app.secrets.len(), 2);
         assert_eq!(app.secrets[1].name, "beta");
@@ -2788,10 +3222,64 @@ mod tests {
         app.on_key(key(KeyCode::Char('e')));
         app.on_key(key(KeyCode::Tab));
         app.on_key(key(KeyCode::Tab));
-        app.on_key(key(KeyCode::Char('x')));
+        for character in "2026".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
         assert!(app.on_key(key(KeyCode::Enter)).is_none());
         assert!(app.editor.is_some());
         assert!(app.status.starts_with("expires:"));
+    }
+
+    #[test]
+    fn editor_rejects_expiry_before_activation() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+        app.values.insert("alpha".into(), Ok("secret".into()));
+        app.pane = Pane::Secrets;
+        app.on_key(key(KeyCode::Char('e')));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        for character in "20270101".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        app.on_key(key(KeyCode::Tab));
+        for character in "20270501".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+
+        assert!(app.on_key(key(KeyCode::Enter)).is_none());
+        assert!(app.editor.is_some(), "the editor stays open");
+        assert_eq!(app.status, "expires: must be after activates");
+    }
+
+    #[test]
+    fn date_fields_insert_dashes_while_typing() {
+        let mut field = EditField::date("expires", "");
+        assert_eq!(field.placeholder(), Some("____-__-__"));
+        for character in "20261031".chars() {
+            field.insert(character);
+        }
+        assert_eq!(field.text(), "2026-10-31");
+        field.backspace();
+        assert_eq!(field.text(), "2026-10-3");
+        field.insert('1');
+        assert_eq!(field.text(), "2026-10-31");
+        field.insert('-');
+        assert_eq!(field.text(), "2026-10-31", "dashes are inserted, not typed");
+        assert_eq!(field.placeholder(), None);
+    }
+
+    #[test]
+    fn date_fields_format_pasted_dates() {
+        let mut field = EditField::date("activates", "");
+        field.insert_text("2026-12-01");
+        assert_eq!(field.text(), "2026-12-01");
+    }
+
+    #[test]
+    fn text_fields_have_no_date_mask() {
+        assert_eq!(EditField::new("type", "").placeholder(), None);
     }
 
     #[test]
@@ -2819,7 +3307,7 @@ mod tests {
         let mut saved = meta("alpha");
         saved.content_type = Some("application/json".into());
         let url = app.vault().unwrap().url;
-        let action = app.handle(Msg::Saved { url, name: "alpha".into(), value: "new".into(), result: Ok(saved) });
+        let action = app.handle(Msg::Saved { url, name: "alpha".into(), value: Some("new".into()), result: Ok(saved) });
         assert!(action.is_none(), "saving must not reload the vault");
         assert!(app.editor.is_none());
         assert_eq!(app.secrets.len(), 2);
@@ -2838,7 +3326,7 @@ mod tests {
         app.on_key(key(KeyCode::Char('e')));
         assert!(app.editor.is_some());
         let url = app.vault().unwrap().url;
-        app.handle(Msg::Saved { url, name: "alpha".into(), value: "x".into(), result: Err("boom".into()) });
+        app.handle(Msg::Saved { url, name: "alpha".into(), value: Some("x".into()), result: Err("boom".into()) });
         assert!(app.editor.is_some());
         assert!(app.status.contains("boom"));
     }
@@ -2861,7 +3349,7 @@ mod tests {
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Secrets;
-        assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
+        assert!(app.on_key(key(KeyCode::Char('V'))).is_none());
         let picker = app.picker.as_ref().unwrap();
         assert_eq!(picker.kind, PickerKind::CopySubscription);
         assert_eq!(picker.items.len(), 2);
@@ -2886,7 +3374,7 @@ mod tests {
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Secrets;
-        assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
+        assert!(app.on_key(key(KeyCode::Char('V'))).is_none());
         let picker = app.picker.as_ref().unwrap();
         assert_eq!(picker.kind, PickerKind::CopyVault);
         assert_eq!(picker.items, vec!["kv-b  (prod)".to_string()]);
@@ -2899,7 +3387,7 @@ mod tests {
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Secrets;
-        assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
+        assert!(app.on_key(key(KeyCode::Char('V'))).is_none());
         assert_eq!(app.picker.as_ref().unwrap().kind, PickerKind::CopySubscription);
         assert!(app.on_key(key(KeyCode::Enter)).is_none());
         let picker = app.picker.as_ref().unwrap();
@@ -2914,7 +3402,7 @@ mod tests {
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Secrets;
-        app.on_key(key(KeyCode::Char('C')));
+        app.on_key(key(KeyCode::Char('V')));
         app.on_key(key(KeyCode::Enter));
         let action = app.on_key(key(KeyCode::Char('r'))).unwrap();
         assert!(matches!(action, Action::LoadVaults { .. }));
@@ -2959,10 +3447,15 @@ mod tests {
     }
 
     #[test]
-    fn copy_all_uses_the_vault_picker_and_reports_progress() {
+    fn copy_matching_uses_the_vault_picker_and_reports_progress() {
         let mut app = loaded_app();
         with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Vaults;
+        assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
+        assert!(app.picker.is_none());
+
+        app.pane = Pane::Secrets;
         assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
         assert_eq!(app.picker.as_ref().unwrap().kind, PickerKind::CopySubscription);
         assert_eq!(app.copy_source.as_ref().unwrap().name, "kv-a");
@@ -2995,6 +3488,29 @@ mod tests {
         });
         assert_eq!(app.status, "copied 2 secrets to kv-b, 1 already existed");
         assert!(!app.loading);
+    }
+
+    #[test]
+    fn copy_vault_carries_the_secret_filter() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+        app.pane = Pane::Secrets;
+        app.secret_filter = "db|api".into();
+        assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
+        let subscription = app.subscription().unwrap();
+        app.copy_sub = Some(subscription.clone());
+        app.handle(Msg::CopyVaults {
+            subscription_id: subscription.id.clone(),
+            result: Ok(vec![vault("kv-a", &subscription), vault("kv-b", &subscription)]),
+        });
+        let action = app.on_key(key(KeyCode::Enter)).unwrap();
+        let Action::CopyVault { filter, dest, .. } = action else {
+            panic!("expected CopyVault, got {action:?}");
+        };
+        assert_eq!(filter, "db|api");
+        assert_eq!(dest.name, "kv-b");
+        assert_eq!(app.status, "copying secrets matching [db|api] to kv-b...");
     }
 
     #[test]
@@ -3154,10 +3670,16 @@ mod tests {
             app.on_key(key(KeyCode::Char(character)));
         }
         let action = app.on_key(key(KeyCode::Enter)).unwrap();
+        let Action::CheckProxy { proxy } = action else {
+            panic!("expected CheckProxy, got {action:?}");
+        };
+        assert!(app.proxy_checking);
+        assert_eq!(proxy.url(), "socks5h://proxy.corp:3128");
+        let action = app.handle(Msg::ProxyChecked { proxy, result: Ok(()) }).unwrap();
         assert!(matches!(action, Action::LoadSecrets { .. }));
         assert!(app.proxy_editor.is_none());
         assert_eq!(app.proxy.as_ref().unwrap().url(), "socks5h://proxy.corp:3128");
-        assert!(app.status.contains("proxy"));
+        assert!(app.status.contains("reachable"));
     }
 
     #[test]
@@ -3185,7 +3707,7 @@ mod tests {
         assert_eq!(editor.host.text(), "localhost");
         assert_eq!(editor.port.text(), "1911");
         // Apply without touching the fields: exact original URL, hidden field wins.
-        app.on_key(key(KeyCode::Enter));
+        confirm_proxy(&mut app);
         assert_eq!(app.proxy.as_ref().unwrap().url(), "socks5h://localhost:1911");
     }
 
@@ -3228,7 +3750,7 @@ mod tests {
         for character in "3128".chars() {
             app.on_key(key(KeyCode::Char(character)));
         }
-        app.on_key(key(KeyCode::Enter));
+        confirm_proxy(&mut app);
         assert_eq!(app.proxy.as_ref().unwrap().url(), "socks5h://proxy.corp:3128");
 
         app.on_key(key(KeyCode::Char('P')));
@@ -3242,7 +3764,7 @@ mod tests {
         assert_eq!(editor.host.text(), "proxy.corp");
         assert_eq!(editor.port.text(), "3128");
         app.on_key(key(KeyCode::Char(' ')));
-        app.on_key(key(KeyCode::Enter));
+        confirm_proxy(&mut app);
         assert_eq!(app.proxy.as_ref().unwrap().url(), "socks5h://proxy.corp:3128");
     }
 
@@ -3257,9 +3779,29 @@ mod tests {
 
         app.on_key(key(KeyCode::Char('P')));
         app.on_key(key(KeyCode::Char(' ')));
-        app.on_key(key(KeyCode::Enter));
+        confirm_proxy(&mut app);
         assert_eq!(app.proxy.as_ref().unwrap().url(), "http://proxy.corp:3128");
         assert_eq!(app.proxy.as_ref().unwrap().no_proxy(), Some("localhost,127.0.0.1"));
+    }
+
+    #[test]
+    fn proxy_check_failure_keeps_the_editor_open() {
+        let mut app = loaded_app();
+        app.on_key(key(KeyCode::Char('P')));
+        app.on_key(key(KeyCode::Char(' ')));
+        let action = app.on_key(key(KeyCode::Enter)).unwrap();
+        let Action::CheckProxy { proxy } = action else {
+            panic!("expected CheckProxy, got {action:?}");
+        };
+        // While the check runs, keys cannot close or edit the modal.
+        assert!(app.on_key(key(KeyCode::Esc)).is_none());
+        assert!(app.proxy_editor.is_some());
+
+        app.handle(Msg::ProxyChecked { proxy, result: Err("cannot reach the endpoint".into()) });
+        assert!(app.proxy_editor.is_some());
+        assert!(app.proxy.is_none());
+        assert!(!app.proxy_checking);
+        assert!(app.status.starts_with("proxy check failed"));
     }
 
     #[test]

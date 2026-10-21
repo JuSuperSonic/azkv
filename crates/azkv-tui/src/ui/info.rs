@@ -59,23 +59,19 @@ pub(super) fn draw_info(frame: &mut Frame, app: &App) {
             lines.push(section("network"));
             lines.push(field("public", dash(&info.public_network_access)));
             lines.push(field("firewall", firewall));
+            lines.push(field("private", format!("{} endpoint(s)", info.private_endpoints)));
             let client = match info.client_ip {
                 Some(ip) => {
-                    let (verdict, style) = match info.client_allowed {
-                        Some(true) => ("allowed", Style::new().fg(Color::Green)),
-                        Some(false) => ("denied", Style::new().fg(Color::Red)),
-                        None => ("unknown", Style::new().fg(DIM)),
-                    };
+                    let (verdict, color) = ip_verdict(info.client_allowed, info.private_endpoints);
                     Line::from(vec![
                         Span::styled(format!("{:<label_width$}", "your ip"), Style::new().fg(DIM)),
                         Span::raw(ip.to_string()),
-                        Span::styled(format!(" · {verdict}"), style),
+                        Span::styled(format!(" · {verdict}"), Style::new().fg(color)),
                     ])
                 },
                 None => field("your ip", "-".into()),
             };
             lines.push(client);
-            lines.push(field("private", format!("{} endpoint(s)", info.private_endpoints)));
             lines.push(Line::from(""));
             lines.push(section("access"));
             let auth = {
@@ -124,10 +120,34 @@ pub(super) fn draw_info(frame: &mut Frame, app: &App) {
     );
 }
 
+/// A denied public address is not a dead end when the vault has a private endpoint.
+fn ip_verdict(allowed: Option<bool>, private_endpoints: usize) -> (&'static str, Color) {
+    match allowed {
+        Some(true) => ("allowed", Color::Green),
+        Some(false) if private_endpoints > 0 => ("public path denied", Color::Yellow),
+        Some(false) => ("denied", Color::Red),
+        None => ("unknown", DIM),
+    }
+}
+
 fn dash(value: &Option<String>) -> String {
     value.clone().unwrap_or_else(|| "-".into())
 }
 
 fn section(title: &str) -> Line<'static> {
     Line::from(Span::styled(title.to_string(), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ip_verdict;
+    use ratatui::style::Color;
+
+    #[test]
+    fn private_endpoint_softens_a_denied_public_address() {
+        assert_eq!(ip_verdict(Some(true), 0), ("allowed", Color::Green));
+        assert_eq!(ip_verdict(Some(false), 0), ("denied", Color::Red));
+        assert_eq!(ip_verdict(Some(false), 1), ("public path denied", Color::Yellow));
+        assert_eq!(ip_verdict(None, 1).0, "unknown");
+    }
 }

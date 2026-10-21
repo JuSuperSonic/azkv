@@ -21,6 +21,9 @@ pub fn short(err: impl Into<anyhow::Error>) -> String {
             "authentication failed (401) — run `az login` for this profile".into()
         },
         Some(Error::Remote { kind: Remote::Forbidden, .. }) => "access denied (403) — check your role".into(),
+        Some(Error::Remote { kind: Remote::Disabled, .. }) => {
+            "secret is disabled — enable it to read or copy the value".into()
+        },
         Some(Error::Remote { kind: Remote::Throttled, .. }) => "throttled by Azure — try again shortly".into(),
         Some(Error::Remote { kind: Remote::SoftDeleted, .. }) => {
             "secret is soft-deleted — recover or purge it before reusing this name".into()
@@ -80,6 +83,12 @@ mod tests {
 
         let expired = Error::Remote { kind: Remote::Unauthorized, message: String::new() };
         assert_eq!(short(expired), "authentication failed (401) — run `az login` for this profile");
+    }
+
+    #[test]
+    fn disabled_secrets_are_explained_instead_of_looking_like_a_role_issue() {
+        let err = Error::Remote { kind: Remote::Disabled, message: "cannot read secret 'db'".into() };
+        assert_eq!(short(err), "secret is disabled — enable it to read or copy the value");
     }
 
     #[test]

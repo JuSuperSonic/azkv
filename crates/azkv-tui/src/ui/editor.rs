@@ -16,16 +16,21 @@ pub(super) fn draw_editor(frame: &mut Frame, editor: &Editor) {
     if let Some(name) = &editor.name {
         lines.push(field_line(name, editor.active == 0, window));
     }
-    lines.extend(
-        editor
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(index, field)| field_line(field, index + offset == editor.active, window)),
-    );
+    lines.extend(editor.fields.iter().enumerate().map(|(index, field)| {
+        let active = index + offset == editor.active;
+        if index == 0 && editor.value_locked {
+            let label = Style::new().fg(if active { ACCENT } else { DIM });
+            Line::from(vec![
+                Span::styled(format!("{:<10}", field.label), label),
+                Span::styled("(disabled — enable to edit the value)", Style::new().fg(DIM)),
+            ])
+        } else {
+            field_line(field, active, window)
+        }
+    }));
     let enabled_active = editor.active == editor.fields.len() + offset;
     lines.push(Line::from(vec![
-        Span::styled(format!("{:<9}", "enabled"), Style::new().fg(if enabled_active { ACCENT } else { DIM })),
+        Span::styled(format!("{:<10}", "enabled"), Style::new().fg(if enabled_active { ACCENT } else { DIM })),
         Span::styled(
             if editor.enabled { "[x] on" } else { "[ ] off" },
             if enabled_active {
@@ -70,11 +75,11 @@ pub(super) fn draw_proxy_editor(frame: &mut Frame, editor: &ProxyEditor) {
     let scheme_style = if editor.active == 1 { selection_style() } else { Style::new().fg(Color::White) };
     let lines = vec![
         Line::from(vec![
-            Span::styled(format!("{:<9}", "enabled"), Style::new().fg(if editor.active == 0 { ACCENT } else { DIM })),
+            Span::styled(format!("{:<10}", "enabled"), Style::new().fg(if editor.active == 0 { ACCENT } else { DIM })),
             Span::styled(if editor.enabled { "[x] on" } else { "[ ] off" }, toggle_style),
         ]),
         Line::from(vec![
-            Span::styled(format!("{:<9}", "scheme"), Style::new().fg(if editor.active == 1 { ACCENT } else { DIM })),
+            Span::styled(format!("{:<10}", "scheme"), Style::new().fg(if editor.active == 1 { ACCENT } else { DIM })),
             Span::styled(if editor.scheme == 1 { "socks5h" } else { "http" }, scheme_style),
         ]),
         field_line(&editor.host, editor.active == 2, window),
@@ -96,7 +101,19 @@ pub(super) fn draw_proxy_editor(frame: &mut Frame, editor: &ProxyEditor) {
 pub(super) fn field_line(field: &EditField, active: bool, window: usize) -> Line<'static> {
     let label = Style::new().fg(if active { ACCENT } else { DIM });
     let display: Vec<char> = field.display().chars().collect();
-    let mut spans = vec![Span::styled(format!("{:<9}", field.label), label)];
+    let mut spans = vec![Span::styled(format!("{:<10}", field.label), label)];
+    if let Some(placeholder) = field.placeholder() {
+        if active {
+            let mut characters = placeholder.chars();
+            if let Some(first) = characters.next() {
+                spans.push(Span::styled(first.to_string(), selection_style()));
+                spans.push(Span::styled(characters.collect::<String>(), Style::new().fg(DIM)));
+            }
+        } else {
+            spans.push(Span::styled(placeholder, Style::new().fg(DIM)));
+        }
+        return Line::from(spans);
+    }
     let cursor = field.cursor().min(display.len());
     let (start, end) = value_window(display.len(), cursor, window);
     if start > 0 {

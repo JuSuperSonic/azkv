@@ -41,6 +41,7 @@ pub(super) fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn draw_vaults(frame: &mut Frame, app: &mut App, area: Rect) {
+    app.vault_rows = area.height.saturating_sub(2) as usize;
     let items: Vec<ListItem> = app
         .visible_vaults()
         .into_iter()
@@ -58,6 +59,8 @@ pub(super) fn draw_vaults(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 pub(super) fn draw_secrets(frame: &mut Frame, app: &mut App, area: Rect) {
+    // Borders plus the header row take three lines off the body.
+    app.secret_rows = area.height.saturating_sub(3) as usize;
     let rows: Vec<Row> = app
         .visible_secrets()
         .into_iter()
@@ -77,11 +80,11 @@ pub(super) fn draw_secrets(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let title = if app.filtering && app.pane == Pane::Secrets {
-        format!(" secrets /{}_ ", app.secret_filter)
+        format!(" secrets /{}_ ({}/{}) ", app.secret_filter, rows.len(), app.secrets.len())
     } else if app.secret_filter.is_empty() {
         format!(" secrets ({}) ", rows.len())
     } else {
-        format!(" secrets [{}] ", app.secret_filter)
+        format!(" secrets [{}] ({}/{}) ", app.secret_filter, rows.len(), app.secrets.len())
     };
     let focused = app.pane == Pane::Secrets;
     let widths = [
@@ -170,29 +173,74 @@ pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(Span::styled(app.status.clone(), status_style)), area);
         return;
     }
-    let hints = if app.info_url.is_some() {
-        info_hints()
-    } else if let Some(picker) = &app.picker {
-        picker_hints(picker.kind)
-    } else if app.filtering {
-        vec![("type", "filter"), ("enter", "keep"), ("esc", "clear")]
-    } else {
-        hints_for(app.pane)
-    };
-    let mut spans = Vec::new();
-    for (key, label) in hints {
-        spans.push(Span::styled(format!(" {key} "), Style::new().fg(ACCENT)));
-        spans.push(Span::styled(format!("{label} "), Style::new().fg(DIM)));
-    }
-    let lines = vec![Line::from(spans), Line::from(Span::styled(app.status.clone(), status_style))];
+    let mut lines = hint_lines(footer_hints(app), area.width);
+    lines.push(Line::from(Span::styled(app.status.clone(), status_style)));
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Rows the footer needs: wrapped hints (at most two) plus the status line.
+pub(super) fn footer_height(app: &App, width: u16) -> u16 {
+    if !app.show_hints {
+        return 1;
+    }
+    hint_lines(footer_hints(app), width).len() as u16 + 1
+}
+
+fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    if app.info_url.is_some() {
+        info_hints()
+    } else if let Some(picker) = &app.picker {
+        picker_hints(picker.kind, picker.filtering)
+    } else if app.filtering {
+        vec![("type", "filter"), ("|", "or"), ("enter", "keep"), ("esc", "clear")]
+    } else {
+        hints_for(app.pane)
+    }
+}
+
+/// Packs hints into rows of `width`, keeping the footer at two rows at most.
+fn hint_lines(hints: Vec<(&'static str, &'static str)>, width: u16) -> Vec<Line<'static>> {
+    const MAX_ROWS: usize = 2;
+    let width = usize::from(width.max(1));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for (key, label) in hints {
+        let item = [
+            Span::styled(format!(" {key} "), Style::new().fg(ACCENT)),
+            Span::styled(format!("{label} "), Style::new().fg(DIM)),
+        ];
+        let item_width: usize = item.iter().map(Span::width).sum();
+        if used > 0 && used + item_width > width {
+            if lines.len() == MAX_ROWS - 1 {
+                if used + 2 <= width {
+                    spans.push(Span::styled("… ", Style::new().fg(DIM)));
+                }
+                break;
+            }
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        spans.extend(item);
+        used += item_width;
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
 /// Footer hints while a picker is open. Only the copy-vault list can reload.
-fn picker_hints(kind: PickerKind) -> Vec<(&'static str, &'static str)> {
+fn picker_hints(kind: PickerKind, filtering: bool) -> Vec<(&'static str, &'static str)> {
+    if filtering {
+        return vec![("type", "filter"), ("|", "or"), ("enter", "keep"), ("esc", "clear")];
+    }
     let mut hints = vec![("↑/↓", "select"), ("enter", "confirm"), ("esc", "cancel")];
     if kind == PickerKind::CopyVault {
         hints.insert(2, ("r", "refresh"));
+    }
+    if kind == PickerKind::Profiles {
+        hints.insert(1, ("/", "filter"));
     }
     hints
 }
@@ -207,14 +255,9 @@ fn hints_for(pane: Pane) -> Vec<(&'static str, &'static str)> {
     let nav = [("↑/↓", "move"), ("g/G", "top/bottom"), ("tab/←→", "pane")];
     let rest = [("/", "filter"), ("P", "proxy"), ("r", "refresh"), ("q", "quit")];
     let pane_specific: &[(&'static str, &'static str)] = match pane {
-        Pane::Vaults => &[
-            ("enter", "secrets"),
-            ("i", "info"),
-            ("C", "copy all"),
-            ("p", "profile"),
-            ("t", "tenant"),
-            ("s", "subscription"),
-        ],
+        Pane::Vaults => {
+            &[("enter", "secrets"), ("i", "info"), ("p", "profile"), ("t", "tenant"), ("s", "subscription")]
+        },
         Pane::Secrets => &[
             ("space", "reveal"),
             ("e", "edit"),
@@ -223,7 +266,9 @@ fn hints_for(pane: Pane) -> Vec<(&'static str, &'static str)> {
             ("D", "delete"),
             ("c", "copy"),
             ("y", "name"),
-            ("C", "→vault"),
+            ("Y", "names"),
+            ("C", "copy matching secrets"),
+            ("V", "copy secret to another vault"),
         ],
     };
     nav.iter().chain(pane_specific.iter()).chain(rest.iter()).copied().collect()
@@ -240,6 +285,7 @@ fn status_is_error(status: &str) -> bool {
         || status.starts_with("clipboard error")
         || status.starts_with("proxy: address")
         || status.starts_with("proxy: invalid")
+        || status.starts_with("proxy check failed")
         || status.starts_with("expires:")
         || status.starts_with("tags:")
 }
@@ -250,7 +296,7 @@ fn field(label: &str, value: impl Into<String>) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hints_for, info_hints, picker_hints, status_is_error};
+    use super::{hint_lines, hints_for, info_hints, picker_hints, status_is_error};
     use crate::app::{Pane, PickerKind};
 
     #[test]
@@ -259,7 +305,7 @@ mod tests {
         assert!(vaults.contains(&("enter", "secrets")));
         assert!(vaults.contains(&("g/G", "top/bottom")));
         assert!(vaults.contains(&("p", "profile")));
-        assert!(vaults.contains(&("C", "copy all")));
+        assert!(!vaults.iter().any(|(key, _)| *key == "C"));
         assert!(!vaults.iter().any(|(_, label)| *label == "delete"));
 
         let secrets = hints_for(Pane::Secrets);
@@ -267,6 +313,8 @@ mod tests {
         assert!(secrets.contains(&("D", "delete")));
         assert!(secrets.contains(&("a", "new")));
         assert!(secrets.contains(&("space", "reveal")));
+        assert!(secrets.contains(&("C", "copy matching secrets")));
+        assert!(secrets.contains(&("V", "copy secret to another vault")));
         assert!(secrets.contains(&("g/G", "top/bottom")));
         assert!(!secrets.iter().any(|(key, _)| *key == "enter"));
         assert!(!secrets.iter().any(|(_, label)| *label == "info"));
@@ -276,10 +324,29 @@ mod tests {
     }
 
     #[test]
+    fn hint_rows_wrap_to_two_at_most() {
+        let hints = hints_for(Pane::Secrets);
+        assert_eq!(hint_lines(hints.clone(), 400).len(), 1, "wide terminals keep one row");
+
+        let wrapped = hint_lines(hints.clone(), 60);
+        assert_eq!(wrapped.len(), 2);
+        assert!(wrapped.iter().all(|line| line.width() <= 60));
+
+        assert_eq!(hint_lines(hints, 10).len(), 2, "narrow terminals are capped at two rows");
+    }
+
+    #[test]
     fn copy_vault_picker_has_refresh_hint() {
-        let hints = picker_hints(PickerKind::CopyVault);
+        let hints = picker_hints(PickerKind::CopyVault, false);
         assert!(hints.contains(&("r", "refresh")));
-        assert!(!picker_hints(PickerKind::Subscriptions).iter().any(|(key, _)| *key == "r"));
+        assert!(!picker_hints(PickerKind::Subscriptions, false).iter().any(|(key, _)| *key == "r"));
+    }
+
+    #[test]
+    fn only_the_profile_picker_advertises_filtering() {
+        assert!(picker_hints(PickerKind::Profiles, false).contains(&("/", "filter")));
+        assert!(!picker_hints(PickerKind::Tenants, false).contains(&("/", "filter")));
+        assert!(picker_hints(PickerKind::Profiles, true).contains(&("esc", "clear")));
     }
 
     #[test]

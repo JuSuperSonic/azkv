@@ -12,7 +12,7 @@ use ratatui::layout::{Constraint, Layout};
 use crate::app::App;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let footer = if app.show_hints { 2 } else { 1 };
+    let footer = if app.show_hints { panes::footer_height(app, frame.area().width) } else { 1 };
     let areas =
         Layout::vertical([Constraint::Length(1), Constraint::Min(3), Constraint::Length(footer)]).split(frame.area());
 

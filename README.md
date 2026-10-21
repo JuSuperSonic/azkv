@@ -33,7 +33,8 @@ Basic keys:
 | `e` | Edit secret |
 | `d` | Duplicate secret |
 | `D` | Delete secret |
-| `C` | Copy secret or vault |
+| `C` | Copy matching secrets (all or filtered) |
+| `V` | Copy selected secret to another vault |
 | `i` | Vault info |
 | `P` | Configure proxy |
 | `r` | Refresh |
