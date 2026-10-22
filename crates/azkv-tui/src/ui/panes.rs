@@ -146,7 +146,7 @@ pub(super) fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
         },
         Some(Ok(value)) => {
             let length = value.chars().count();
-            lines.push(Line::from(Span::styled("•".repeat(length.min(40)), Style::new().fg(DIM))));
+            lines.push(Line::from(Span::styled("•".repeat(20), Style::new().fg(DIM))));
             lines.push(Line::from(Span::styled(
                 format!("{length} chars - space to reveal, c to copy"),
                 Style::new().fg(DIM),
