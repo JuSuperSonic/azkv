@@ -2,16 +2,26 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
   "prConcurrentLimit": 2,
-  "rangeStrategy": "bump",
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 5am on monday"]
   },
   "packageRules": [
     {
+      "matchDepTypes": ["workspace.dependencies"],
+      "rangeStrategy": "pin"
+    },
+    {
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "matchCurrentVersion": "!/^0\\./",
       "groupName": "minor and patch updates",
       "automerge": true
+    },
+    {
+      "matchUpdateTypes": ["minor", "patch"],
+      "matchCurrentVersion": "/^0\\./",
+      "groupName": "0.x updates (manual review)",
+      "automerge": false
     },
     {
       "matchUpdateTypes": ["major"],
