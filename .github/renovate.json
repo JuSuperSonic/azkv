@@ -17,7 +17,7 @@
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "matchCurrentVersion": "!/^0\\./",
       "groupName": "minor and patch updates",
-      "automerge": false
+      "automerge": true
     },
     {
       "matchUpdateTypes": ["minor", "patch"],
