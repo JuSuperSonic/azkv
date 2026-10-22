@@ -6,7 +6,7 @@
   "osvVulnerabilityAlerts": true,
   "vulnerabilityAlerts": {
     "enabled": true,
-    "rangeStrategy": "update-lockfile"
+    "rangeStrategy": "pin"
   },
   "lockFileMaintenance": {
     "enabled": true,
