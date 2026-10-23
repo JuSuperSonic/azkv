@@ -44,10 +44,21 @@ jobs:
           toolchain: 1.99.1
       - run: cargo build --locked --release --bins
       - name: Package
-        run: |
+        run: |-
           mkdir -p dist
-          tar -czf "dist/azkv-${GITHUB_REF_NAME}-${{ matrix.asset }}.tar.gz" \
-            -C target/release azkv azkvctl
+          tag="${GITHUB_REF_NAME}"
+          metadata=$(cargo metadata --locked --no-deps --format-version 1)
+          version() { jq --raw-output --arg p "${1}" '.packages[]|select(.name==$p)|.version' <<<"${metadata}"; }
+          found=0
+          if [[ "$(version azkv-tui)" = "${tag}" ]]; then
+            tar -czf "dist/azkv-${tag}-${{ matrix.asset }}.tar.gz" -C target/release azkv
+            found=1
+          fi
+          if [[ "$(version azkv-cli)" = "${tag}" ]]; then
+            tar -czf "dist/azkvctl-${tag}-${{ matrix.asset }}.tar.gz" -C target/release azkvctl
+            found=1
+          fi
+          [[ "${found}" = 1 ]] || { echo "::error::tag ${tag} matches neither azkv-tui nor azkv-cli version"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ${{ matrix.asset }}
