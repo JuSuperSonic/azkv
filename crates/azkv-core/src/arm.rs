@@ -15,7 +15,6 @@ use crate::model::{Subscription, Tenant, Vault, VaultInfo};
 use crate::proxy::ProxySettings;
 
 const ARM: &str = "https://management.azure.com";
-/// Role definitions rarely change; one list response is ~1 MB.
 const ROLE_CACHE_TTL: Duration = Duration::from_secs(300);
 type RoleNames = HashMap<String, String>;
 type RoleNameCache = HashMap<String, (Instant, RoleNames)>;
@@ -25,18 +24,12 @@ static ROLE_NAMES: OnceLock<Mutex<RoleNameCache>> = OnceLock::new();
 pub struct Overview {
     pub subscriptions: Vec<Subscription>,
     pub tenants: Vec<Tenant>,
-    /// Tenants whose subscription lookup failed while others succeeded.
     pub warnings: Vec<String>,
 }
 
 /// Azure Resource Manager client: subscriptions, tenants, vaults and role
 /// assignments over ARM REST. Tokens come from the Azure CLI's MSAL cache,
 /// refreshed natively without starting the `az` binary.
-///
-/// ARM is spoken directly because the official Rust SDK has no management
-/// clients for `azure_core` 1.x: the published `azure_mgmt_*` crates are from
-/// the legacy 0.21 line. The reqwest client is the same one injected into the
-/// Key Vault SDK as its `HttpClient`, so SOCKS5h works identically here.
 #[derive(Clone)]
 pub struct Arm {
     http: Client,
@@ -125,7 +118,6 @@ impl Arm {
         let claims = claims_from_token(&token);
         let Claims { name, oid } = claims;
         info.user = name;
-        // Access-policy vaults have no relevant RBAC roles; only query IAM ones.
         if info.rbac == Some(true) {
             match oid {
                 Some(oid) => {
@@ -276,15 +268,11 @@ impl Arm {
 
     /// Public egress IP, requested through the same proxy as Azure calls.
     async fn client_ip(&self) -> Option<IpAddr> {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            let response = self.http.get("https://api.ipify.org").send().await.ok()?;
-            if !response.status().is_success() {
-                return None;
-            }
-            response.text().await.ok()?.trim().parse().ok()
-        })
-        .await
-        .ok()?
+        let response = self.http.get("https://api.ipify.org").timeout(Duration::from_secs(2)).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.text().await.ok()?.trim().parse().ok()
     }
 
     async fn get_text(&self, token: &str, url: &str) -> Result<String> {
