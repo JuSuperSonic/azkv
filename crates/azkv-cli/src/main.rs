@@ -11,13 +11,14 @@ use azkv_core::{Overview, Profile, ProxySettings, Secret, SecretStore, Subscript
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use futures::stream;
+use tracing::{error, info, warn};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{EnvFilter, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser)]
-#[command(name = "azkvctl", about = "Azure Key Vault CLI: browse and copy secrets")]
+#[command(name = "azkvctl", version, about = "Azure Key Vault CLI: browse and copy secrets")]
 struct Cli {
     /// Azure CLI profile: name under ~/.azure, or a config dir path
     #[arg(long, global = true, env = "AZKV_PROFILE")]
@@ -139,7 +140,7 @@ fn arm_for(profile: &Profile, proxy: &Option<ProxySettings>) -> Result<Arm> {
 
 fn warn_overview(overview: &Overview) {
     for warning in &overview.warnings {
-        tracing::warn!("{warning}");
+        warn!("{warning}");
     }
 }
 
@@ -173,7 +174,7 @@ async fn main() -> Result<()> {
             let active = profiles::active().ok();
             for profile in profiles::discover()? {
                 let marker = if active.as_ref().is_some_and(|a| a.dir == profile.dir) { "*" } else { " " };
-                tracing::info!(target: OUTPUT, "{marker} {:<12} {}", profile.name, profile.dir.display());
+                info!(target: OUTPUT, "{marker} {:<12} {}", profile.name, profile.dir.display());
             }
         },
         Command::Tenants => {
@@ -181,7 +182,7 @@ async fn main() -> Result<()> {
             warn_overview(&overview);
             for tenant in &overview.tenants {
                 let count = overview.subscriptions.iter().filter(|sub| sub.tenant_id == tenant.id).count();
-                tracing::info!(target: OUTPUT, "{}\t{}\t{} subscriptions", tenant.name, tenant.id, count);
+                info!(target: OUTPUT, "{}\t{}\t{} subscriptions", tenant.name, tenant.id, count);
             }
         },
         Command::Subscriptions { tenant } => {
@@ -193,7 +194,7 @@ async fn main() -> Result<()> {
             };
             for sub in &subs {
                 let marker = if sub.is_default { "*" } else { " " };
-                tracing::info!(target: OUTPUT, "{marker} {}\t{}\t{}\t{}", sub.name, sub.id, sub.tenant_id, sub.state);
+                info!(target: OUTPUT, "{marker} {}\t{}\t{}\t{}", sub.name, sub.id, sub.tenant_id, sub.state);
             }
         },
         Command::Vaults { subscription, tenant, all } => {
@@ -219,7 +220,7 @@ async fn main() -> Result<()> {
                     },
                 };
                 for vault in arm.vaults(&sub).await? {
-                    tracing::info!(target: OUTPUT, "{}", vault.url);
+                    info!(target: OUTPUT, "{}", vault.url);
                 }
             }
         },
@@ -227,19 +228,19 @@ async fn main() -> Result<()> {
             let connected = connect(&profile, &vault, subscription.as_deref(), &proxy).await?;
             let client = vault_client(&connected, &proxy)?;
             for name in client.names().await? {
-                tracing::info!(target: OUTPUT, "{name}");
+                info!(target: OUTPUT, "{name}");
             }
         },
         Command::Get { vault, name, version, subscription } => {
             let connected = connect(&profile, &vault, subscription.as_deref(), &proxy).await?;
             let client = vault_client(&connected, &proxy)?;
             let secret = client.get_version(&name, version.as_deref()).await?;
-            tracing::info!(target: OUTPUT, "{}", secret.value);
+            info!(target: OUTPUT, "{}", secret.value);
         },
         Command::Set { vault, name, subscription } => {
             let mut value = String::new();
             if std::io::stdin().is_terminal() {
-                eprintln!("reading secret value from stdin (end with Ctrl-D)");
+                error!("reading secret value from stdin (end with Ctrl-D)");
             }
             std::io::stdin().read_to_string(&mut value).context("cannot read the secret value from stdin")?;
             let connected = connect(&profile, &vault, subscription.as_deref(), &proxy).await?;
@@ -253,12 +254,12 @@ async fn main() -> Result<()> {
                 not_before: None,
             };
             vault_client(&connected, &proxy)?.put(&secret).await?;
-            tracing::info!(target: OUTPUT, "secret '{name}' set");
+            info!(target: OUTPUT, "secret '{name}' set");
         },
         Command::Delete { vault, name, subscription } => {
             let connected = connect(&profile, &vault, subscription.as_deref(), &proxy).await?;
             vault_client(&connected, &proxy)?.delete(&name).await?;
-            tracing::info!(target: OUTPUT, "secret '{name}' deletion initiated");
+            info!(target: OUTPUT, "secret '{name}' deletion initiated");
         },
         Command::Copy {
             from,
@@ -286,15 +287,15 @@ async fn main() -> Result<()> {
             let dest_client = vault_client(&dest, &proxy)?;
             let plan = make_plan(&source_client, &dest_client, overwrite).await?;
             for line in render_plan(&source.vault, &dest.vault, &plan) {
-                tracing::info!(target: OUTPUT, "{line}");
+                info!(target: OUTPUT, "{line}");
             }
             if dry_run {
-                tracing::info!(target: OUTPUT, "dry run: nothing written");
+                info!(target: OUTPUT, "dry run: nothing written");
                 return Ok(());
             }
             let report = execute_copy(&source_client, &dest_client, &plan, concurrency).await;
             for line in render_report(&report) {
-                tracing::info!(target: OUTPUT, "{line}");
+                info!(target: OUTPUT, "{line}");
             }
             if !report.succeeded() {
                 bail!("{} secret(s) failed to copy", report.failed.len());
@@ -330,10 +331,10 @@ async fn list_all_vaults(arm: &Arm, subs: &[Subscription]) {
         match result {
             Ok(vaults) => {
                 for vault in vaults {
-                    tracing::info!(target: OUTPUT, "{}\t{}", vault.url, sub.name);
+                    info!(target: OUTPUT, "{}\t{}", vault.url, sub.name);
                 }
             },
-            Err(err) => tracing::warn!(subscription = %sub.name, "cannot list vaults: {err:#}"),
+            Err(err) => warn!(subscription = %sub.name, "cannot list vaults: {err:#}"),
         }
     }
 }
