@@ -22,7 +22,7 @@ pub(super) fn draw_editor(frame: &mut Frame, editor: &Editor) {
             let label = Style::new().fg(if active { ACCENT } else { DIM });
             Line::from(vec![
                 Span::styled(format!("{:<10}", field.label), label),
-                Span::styled("(disabled — enable to edit the value)", Style::new().fg(DIM)),
+                Span::styled("(disabled : enable to edit the value)", Style::new().fg(DIM)),
             ])
         } else {
             field_line(field, active, window)
@@ -47,7 +47,7 @@ pub(super) fn draw_editor(frame: &mut Frame, editor: &Editor) {
         "tab/↑↓ field · space toggle · ctrl+a/e start/end · enter save · esc cancel",
         Style::new().fg(DIM),
     )));
-    lines.push(Line::from(Span::styled("value: shift+enter or ctrl+j newline · ctrl+v paste", Style::new().fg(DIM))));
+    lines.push(Line::from(Span::styled("value: shift+enter newline · ctrl+v paste", Style::new().fg(DIM))));
     lines.push(Line::from(Span::styled(
         "tags key=value, key=value · expires/activates YYYY-MM-DD",
         Style::new().fg(DIM),
