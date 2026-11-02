@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use futures::stream::{self, StreamExt};
 
-use crate::error::Result;
+use crate::error::{Error, Remote, Result};
 use crate::vault::SecretStore;
 
 pub const DEFAULT_CONCURRENCY: usize = 8;
@@ -84,7 +84,10 @@ pub async fn execute_copy<S: SecretStore, D: SecretStore>(
         match result {
             Ok(()) if overwrites.contains(name.as_str()) => report.overwritten.push(name),
             Ok(()) => report.created.push(name),
-            Err(err) => report.failed.push((name, err.to_string())),
+            Err(err) => {
+                let message = failure_message(&name, &err);
+                report.failed.push((name, message));
+            },
         }
     }
     report.created.sort();
@@ -96,6 +99,17 @@ pub async fn execute_copy<S: SecretStore, D: SecretStore>(
 async fn copy_one<S: SecretStore, D: SecretStore>(source: &S, dest: &D, name: &str) -> Result<()> {
     let secret = source.get(name).await?;
     dest.put(&secret).await.map(|_| ())
+}
+
+fn failure_message(name: &str, err: &Error) -> String {
+    match err {
+        Error::Remote { kind: Remote::SoftDeleted, .. } => {
+            format!(
+                "destination secret '{name}' is soft-deleted: recover or purge it in the destination, then copy again"
+            )
+        },
+        _ => err.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +145,7 @@ mod tests {
     struct FakeVault {
         secrets: Mutex<BTreeMap<String, Secret>>,
         fail_put: BTreeSet<String>,
+        fail_put_deleted: BTreeSet<String>,
         gets: Mutex<usize>,
         puts: Mutex<usize>,
     }
@@ -177,6 +192,12 @@ mod tests {
                 return Err(Error::Remote {
                     kind: Remote::Forbidden,
                     message: format!("access denied for {}", secret.name),
+                });
+            }
+            if self.fail_put_deleted.contains(&secret.name) {
+                return Err(Error::Remote {
+                    kind: Remote::SoftDeleted,
+                    message: format!("cannot write secret '{}': Conflict: deleted but recoverable state", secret.name),
                 });
             }
             self.insert(secret.clone());
@@ -294,6 +315,19 @@ mod tests {
         assert_eq!(report.created, names(&["a", "d"]));
         assert_eq!(report.failed.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["b", "c"]);
         assert!(report.failed[0].1.contains("access denied"));
+        assert!(!report.succeeded());
+    }
+
+    #[tokio::test]
+    async fn soft_deleted_destination_failure_explains_the_fix() {
+        let source = FakeVault::with(&["a"]);
+        let dest = FakeVault { fail_put_deleted: set(&["a"]), ..Default::default() };
+
+        let plan = make_plan(&source, &dest, false).await.unwrap();
+        let report = execute_copy(&source, &dest, &plan, 2).await;
+
+        assert_eq!(report.failed[0].0, "a");
+        assert!(report.failed[0].1.contains("recover or purge"), "{}", report.failed[0].1);
         assert!(!report.succeeded());
     }
 
