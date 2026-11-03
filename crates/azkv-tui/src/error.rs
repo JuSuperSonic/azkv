@@ -1,5 +1,5 @@
 use azkv_core::{Error, Remote};
-
+use tracing::error;
 /// Status-bar error: one readable sentence, with the full cause kept in the log.
 pub fn short(err: impl Into<anyhow::Error>) -> String {
     let err = err.into();
@@ -38,7 +38,7 @@ pub fn short(err: impl Into<anyhow::Error>) -> String {
     }
 }
 
-fn clip(text: &str, max: usize) -> String {
+pub(crate) fn clip(text: &str, max: usize) -> String {
     let mut chars = text.chars();
     let clipped: String = chars.by_ref().take(max).collect();
     if chars.next().is_some() { format!("{}…", clipped.trim_end()) } else { clipped }
@@ -46,12 +46,13 @@ fn clip(text: &str, max: usize) -> String {
 
 /// Keep the full cause chain out of the TUI but available for diagnosis.
 pub fn log_error(err: &anyhow::Error) {
-    tracing::error!("{err:#}");
+    error!("{err:#}");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn connect(proxy: Option<&str>, dns: bool, timeout: bool) -> Error {
         Error::Connect { proxy: proxy.map(str::to_string), dns, timeout, message: String::new() }
@@ -116,12 +117,12 @@ mod tests {
             std::process::id(),
             time::OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let file = fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
         let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(file).finish();
         let err = anyhow::anyhow!("permission denied").context("cannot write secret 'db'");
         tracing::subscriber::with_default(subscriber, || log_error(&err));
-        let text = std::fs::read_to_string(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
+        let text = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
         assert!(text.contains("cannot write secret 'db'"));
         assert!(text.contains("permission denied"));
     }

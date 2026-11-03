@@ -1,0 +1,68 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Core - Debug unit tests in library 'azkv_core'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--package=azkv-core"
+                ]
+            }
+        },
+        {
+            "name": "Cli - Debug executable 'azkvctl'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=azkvctl",
+                    "--package=azkv-cli"
+                ]
+            },
+            "args": []
+        },
+        {
+            "name": "Cli - Debug unit tests in executable 'azkvctl'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=azkvctl",
+                    "--package=azkv-cli"
+                ]
+            }
+        },
+        {
+            "name": "Tui - Debug executable 'azkv'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin",
+                    "azkv"
+                ]
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "terminal": "integrated"
+        },
+        {
+            "name": "Tui - Debug unit tests in executable 'azkv'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=azkv",
+                    "--package=azkv-tui"
+                ]
+            }
+        }
+    ]
+}

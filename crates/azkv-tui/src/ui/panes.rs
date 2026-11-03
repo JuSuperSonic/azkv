@@ -160,7 +160,7 @@ pub(super) fn draw_details(frame: &mut Frame, app: &App, area: Rect) {
 pub(super) fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     let status_style = if status_is_error(&app.status) {
         Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
-    } else if app.confirm_overwrite.is_some() {
+    } else if app.copy_review.is_some() {
         Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     } else {
         Style::new().fg(DIM)
@@ -183,8 +183,12 @@ pub(super) fn footer_height(app: &App, width: u16) -> u16 {
 }
 
 fn footer_hints(app: &App) -> Vec<(&'static str, &'static str)> {
-    if app.info_url.is_some() {
+    if app.help {
+        vec![("h/esc", "close help")]
+    } else if app.info_url.is_some() {
         info_hints()
+    } else if app.copy_review.is_some() {
+        vec![("←/→", "select"), ("enter", "confirm"), ("esc", "cancel")]
     } else if let Some(picker) = &app.picker {
         picker_hints(picker.kind, picker.filtering)
     } else if app.filtering {
@@ -231,12 +235,9 @@ fn picker_hints(kind: PickerKind, filtering: bool) -> Vec<(&'static str, &'stati
     if filtering {
         return vec![("type", "filter"), ("|", "or"), ("enter", "keep"), ("esc", "clear")];
     }
-    let mut hints = vec![("↑/↓", "select"), ("enter", "confirm"), ("esc", "cancel")];
+    let mut hints = vec![("↑/↓", "select"), ("/", "filter"), ("enter", "confirm"), ("esc", "cancel")];
     if kind == PickerKind::CopyVault {
-        hints.insert(2, ("r", "refresh"));
-    }
-    if kind == PickerKind::Profiles {
-        hints.insert(1, ("/", "filter"));
+        hints.insert(3, ("r", "refresh"));
     }
     hints
 }
@@ -246,28 +247,49 @@ fn info_hints() -> Vec<(&'static str, &'static str)> {
     vec![("↑/↓", "vault"), ("r", "refresh"), ("esc", "close")]
 }
 
+type Shortcuts = &'static [(&'static str, &'static str)];
+
+const NAV: Shortcuts = &[("↑/↓", "move"), ("g/G", "top/bottom"), ("tab/←→", "pane")];
+const GLOBAL: Shortcuts = &[("/", "filter"), ("P", "proxy"), ("r", "refresh"), ("h", "help"), ("q", "quit")];
+const VAULTS: Shortcuts =
+    &[("enter", "secrets"), ("i", "vault details"), ("p", "profile"), ("t", "tenant"), ("s", "subscription")];
+const SECRETS: Shortcuts = &[
+    ("space", "reveal"),
+    ("e", "edit"),
+    ("a", "new"),
+    ("d", "duplicate"),
+    ("D", "delete"),
+    ("c", "copy secret"),
+    ("y", "copy name"),
+    ("Y", "copy names"),
+    ("C", "copy secrets"),
+];
+
+/// Shortcut groups for the focused pane; the footer flattens them, the help window lists them.
+pub(super) fn shortcut_groups(pane: Pane) -> [(&'static str, Shortcuts); 3] {
+    let (title, keys) = match pane {
+        Pane::Vaults => ("vaults", VAULTS),
+        Pane::Secrets => ("secrets", SECRETS),
+    };
+    [("navigation", NAV), (title, keys), ("global", GLOBAL)]
+}
+
+/// Extra explanation for keys whose footer label is too terse to stand alone.
+pub(super) fn shortcut_detail(pane: Pane, key: &str) -> Option<&'static str> {
+    match (pane, key) {
+        (Pane::Secrets, "c") => Some("value to the clipboard"),
+        (Pane::Secrets, "y") => Some("selected secret name to the clipboard"),
+        (Pane::Secrets, "Y") => Some("every visible name, one per line; follows the filter"),
+        (Pane::Secrets, "C") => {
+            Some("all secrets, or only those matching the filter; asks about each one that already exists")
+        },
+        _ => None,
+    }
+}
+
 /// Footer hints for the focused pane; global keys stay in both lists.
 fn hints_for(pane: Pane) -> Vec<(&'static str, &'static str)> {
-    let nav = [("↑/↓", "move"), ("g/G", "top/bottom"), ("tab/←→", "pane")];
-    let rest = [("/", "filter"), ("P", "proxy"), ("r", "refresh"), ("q", "quit")];
-    let pane_specific: &[(&'static str, &'static str)] = match pane {
-        Pane::Vaults => {
-            &[("enter", "secrets"), ("i", "info"), ("p", "profile"), ("t", "tenant"), ("s", "subscription")]
-        },
-        Pane::Secrets => &[
-            ("space", "reveal"),
-            ("e", "edit"),
-            ("a", "new"),
-            ("d", "duplicate"),
-            ("D", "delete"),
-            ("c", "copy"),
-            ("y", "name"),
-            ("Y", "names"),
-            ("C", "copy matching secrets"),
-            ("V", "copy secret to another vault"),
-        ],
-    };
-    nav.iter().chain(pane_specific.iter()).chain(rest.iter()).copied().collect()
+    shortcut_groups(pane).into_iter().flat_map(|(_, keys)| keys.iter().copied()).collect()
 }
 
 /// Status messages that must stand out from normal progress text.
@@ -292,7 +314,7 @@ fn field(label: &str, value: impl Into<String>) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hint_lines, hints_for, info_hints, picker_hints, status_is_error};
+    use super::{hint_lines, hints_for, info_hints, picker_hints, shortcut_detail, shortcut_groups, status_is_error};
     use crate::app::{Pane, PickerKind};
 
     #[test]
@@ -301,6 +323,7 @@ mod tests {
         assert!(vaults.contains(&("enter", "secrets")));
         assert!(vaults.contains(&("g/G", "top/bottom")));
         assert!(vaults.contains(&("p", "profile")));
+        assert!(vaults.contains(&("i", "vault details")));
         assert!(!vaults.iter().any(|(key, _)| *key == "C"));
         assert!(!vaults.iter().any(|(_, label)| *label == "delete"));
 
@@ -309,14 +332,29 @@ mod tests {
         assert!(secrets.contains(&("D", "delete")));
         assert!(secrets.contains(&("a", "new")));
         assert!(secrets.contains(&("space", "reveal")));
-        assert!(secrets.contains(&("C", "copy matching secrets")));
-        assert!(secrets.contains(&("V", "copy secret to another vault")));
+        assert!(secrets.contains(&("C", "copy secrets")));
+        assert!(!secrets.iter().any(|(key, _)| *key == "V"));
         assert!(secrets.contains(&("g/G", "top/bottom")));
         assert!(!secrets.iter().any(|(key, _)| *key == "enter"));
-        assert!(!secrets.iter().any(|(_, label)| *label == "info"));
+        assert!(!secrets.iter().any(|(_, label)| *label == "vault details"));
 
         assert!(secrets.contains(&("P", "proxy")));
         assert!(vaults.contains(&("P", "proxy")));
+        assert!(secrets.contains(&("h", "help")));
+        assert!(vaults.contains(&("h", "help")));
+        assert_eq!(shortcut_groups(Pane::Secrets).len(), 3);
+    }
+
+    #[test]
+    fn terse_copy_keys_carry_a_detail() {
+        let secrets = hints_for(Pane::Secrets);
+        for (key, label) in [("c", "copy secret"), ("y", "copy name"), ("Y", "copy names")] {
+            assert!(secrets.contains(&(key, label)), "{key} must stay in the table");
+            assert!(shortcut_detail(Pane::Secrets, key).is_some(), "{key} needs a detail");
+        }
+        assert_eq!(shortcut_detail(Pane::Vaults, "c"), None);
+        assert_eq!(shortcut_detail(Pane::Secrets, "a"), None);
+        assert!(shortcut_detail(Pane::Secrets, "C").is_some(), "C explains the filter behavior");
     }
 
     #[test]
@@ -339,9 +377,8 @@ mod tests {
     }
 
     #[test]
-    fn only_the_profile_picker_advertises_filtering() {
-        assert!(picker_hints(PickerKind::Profiles, false).contains(&("/", "filter")));
-        assert!(!picker_hints(PickerKind::Tenants, false).contains(&("/", "filter")));
+    fn pickers_advertise_filtering() {
+        assert!(picker_hints(PickerKind::CopyVault, false).contains(&("/", "filter")));
         assert!(picker_hints(PickerKind::Profiles, true).contains(&("esc", "clear")));
     }
 

@@ -1,7 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use azkv_core::copy::CopyPlan;
 use azkv_core::{
     Overview, Profile, ProxySettings, Secret, SecretMeta, Subscription, Tenant, Vault, VaultInfo, clipboard, fmt_date,
     parse_expiry,
@@ -21,14 +22,11 @@ pub enum Action {
     FetchValue { profile: Profile, subscription: Subscription, vault: Vault, name: String },
     RefreshSecret { profile: Profile, subscription: Subscription, vault: Vault, name: String },
     Copy(String),
-    // `None` creates (checking the remote name); `Some(updated)` edits and
-    // refuses if the remote secret changed since it was opened.
-    // `patch` updates attributes without the value, so a disabled secret can be re-enabled.
     SaveSecret { profile: Profile, vault: Vault, secret: Secret, updated: Option<Option<i128>>, patch: bool },
     LoadCopyVaults { profile: Profile, subscription: Subscription },
     CheckProxy { proxy: ProxySettings },
-    CopyToVault { profile: Profile, dest: Vault, secret: Secret, overwrite: bool },
-    CopyVault { profile: Profile, source: Vault, dest: Vault, filter: String },
+    PlanCopyVault { profile: Profile, source: Vault, dest: Vault, filter: String },
+    CopyVault { profile: Profile, source: Vault, dest: Vault, plan: CopyPlan },
     LoadVaultInfo { profile: Profile, vault: Vault },
     DuplicateSecret { profile: Profile, vault: Vault, source: String, name: String },
     DeleteSecret { profile: Profile, vault: Vault, name: String },
@@ -48,8 +46,7 @@ pub enum Msg {
     Saved { url: String, name: String, value: Option<String>, result: Result<SecretMeta, String> },
     CopyVaults { subscription_id: String, result: Result<Vec<Vault>, String> },
     ProxyChecked { proxy: ProxySettings, result: Result<(), String> },
-    CopyToExists { dest: Vault, secret: Secret },
-    CopiedTo { dest: String, name: String, result: Result<(), String> },
+    CopyPlan { source: Vault, dest: Vault, result: Result<CopyPlan, String> },
     CopiedVault { source: String, dest: String, result: Result<azkv_core::copy::CopyReport, String> },
     VaultInfo { url: String, result: Result<VaultInfo, String> },
     Duplicated { url: String, name: String, result: Result<SecretMeta, String> },
@@ -364,6 +361,28 @@ pub struct DeleteConfirm {
     pub yes: bool,
 }
 
+/// Copy plan under review: `queue` holds the destination conflicts still undecided.
+pub struct CopyReview {
+    pub source: Vault,
+    pub dest: Vault,
+    pub plan: CopyPlan,
+    pub queue: VecDeque<String>,
+    pub total: usize,
+    /// `false` is the focused default, so Enter alone skips.
+    pub yes: bool,
+}
+
+impl CopyReview {
+    pub fn current(&self) -> Option<&str> {
+        self.queue.front().map(String::as_str)
+    }
+
+    /// 1-based position of the conflict being asked about.
+    pub fn position(&self) -> usize {
+        self.total.saturating_sub(self.queue.len()) + 1
+    }
+}
+
 pub struct ProxyEditor {
     pub enabled: bool,
     /// 0 = http, 1 = socks5h (ssh -D).
@@ -415,10 +434,8 @@ pub struct App {
     pub pending_edit: Option<String>,
     pub copy_sub: Option<Subscription>,
     pub copy_vaults: Vec<Vault>,
-    pub copy_source: Option<Vault>,
+    pub copy_review: Option<CopyReview>,
     copy_refreshing: bool,
-    pub pending_copy_to: Option<(String, Vault)>,
-    pub confirm_overwrite: Option<(Vault, Secret)>,
     pub pending_select: Option<String>,
     pub duplicate: Option<Duplicate>,
     pub confirm_delete: Option<DeleteConfirm>,
@@ -430,6 +447,7 @@ pub struct App {
     pub info_moved: bool,
     pub info: Option<Result<VaultInfo, String>>,
     info_cache: HashMap<String, (Instant, Result<VaultInfo, String>)>,
+    pub help: bool,
     pub show_hints: bool,
     pub loading: bool,
     pub status: String,
@@ -462,10 +480,8 @@ impl App {
             pending_edit: None,
             copy_sub: None,
             copy_vaults: Vec::new(),
-            copy_source: None,
+            copy_review: None,
             copy_refreshing: false,
-            pending_copy_to: None,
-            confirm_overwrite: None,
             pending_select: None,
             duplicate: None,
             confirm_delete: None,
@@ -477,6 +493,7 @@ impl App {
             info_moved: false,
             info: None,
             info_cache: HashMap::new(),
+            help: false,
             show_hints: true,
             loading: false,
             status: "press p to switch Azure CLI profile".into(),
@@ -651,7 +668,6 @@ impl App {
                         self.revealed = false;
                         self.pending_copy = None;
                         self.pending_edit = None;
-                        self.pending_copy_to = None;
                         let visible = self.visible_secrets();
                         let index = self
                             .pending_select
@@ -686,7 +702,6 @@ impl App {
                 if copying {
                     self.pending_copy = None;
                 }
-                let copying_to = self.pending_copy_to.take();
                 let copy_value = match &result {
                     Ok(value) => copying.then(|| value.clone()),
                     Err(err) => {
@@ -697,12 +712,6 @@ impl App {
                 self.values.insert(name.clone(), result);
                 if editing && self.values.get(&name).is_some_and(Result::is_ok) {
                     return self.open_editor();
-                }
-                if let Some((expected, dest)) = copying_to {
-                    if expected == name {
-                        return self.start_copy(dest, &name);
-                    }
-                    self.status = "copy cancelled: selection changed".into();
                 }
                 copy_value.map(Action::Copy)
             },
@@ -822,7 +831,6 @@ impl App {
                 match result {
                     Ok(vaults) => self.show_copy_vaults(vaults),
                     Err(err) => {
-                        self.copy_source = None;
                         self.status = format!("error: {err}");
                     },
                 }
@@ -845,17 +853,25 @@ impl App {
                     },
                 }
             },
-            Msg::CopyToExists { dest, secret } => {
-                self.status = format!("'{}' exists in {} - y overwrite, n cancel", secret.name, dest.name);
-                self.confirm_overwrite = Some((dest, secret));
-                None
-            },
-            Msg::CopiedTo { dest, name, result } => {
-                self.status = match result {
-                    Ok(()) => format!("copied '{name}' to {dest}"),
-                    Err(err) => format!("copy failed: {err}"),
-                };
-                None
+            Msg::CopyPlan { source, dest, result } => {
+                self.loading = false;
+                match result {
+                    Ok(mut plan) => {
+                        self.copy_review = Some(CopyReview {
+                            source,
+                            dest,
+                            total: plan.skip.len(),
+                            queue: plan.skip.drain(..).collect(),
+                            plan,
+                            yes: false,
+                        });
+                        self.next_conflict()
+                    },
+                    Err(err) => {
+                        self.status = format!("copy failed: {err}");
+                        None
+                    },
+                }
             },
             Msg::CopiedVault { source, dest, result } => {
                 self.loading = false;
@@ -867,12 +883,18 @@ impl App {
                         if copied == 0 && failed == 0 && skipped == 0 {
                             format!("no secrets in {source}")
                         } else if failed > 0 {
+                            let (_, message) = &report.failed[0];
+                            let more = failed.saturating_sub(1);
+                            let more = if more > 0 { format!(" (+{more} more, see log)") } else { String::new() };
                             format!(
-                                "copy failed: {failed} of {} secrets ({copied} copied, {skipped} skipped)",
+                                "copy failed: {} ({failed} of {} secrets, {copied} copied, {skipped} skipped){more}",
+                                crate::error::clip(message, 120),
                                 copied + failed + skipped
                             )
                         } else if skipped > 0 {
                             format!("copied {copied} secrets to {dest}, {skipped} already existed")
+                        } else if !report.overwritten.is_empty() {
+                            format!("copied {copied} secrets to {dest}, {} overwritten", report.overwritten.len())
                         } else {
                             format!("copied {copied} secrets to {dest}")
                         }
@@ -907,6 +929,9 @@ impl App {
             self.show_hints = !self.show_hints;
             return None;
         }
+        if self.help {
+            return self.on_help_key(key);
+        }
         if self.info_url.is_some() {
             return self.on_info_key(key);
         }
@@ -919,8 +944,8 @@ impl App {
         if self.picker.is_some() {
             return self.on_picker_key(key);
         }
-        if self.confirm_overwrite.is_some() {
-            return self.on_confirm_key(key);
+        if self.copy_review.is_some() {
+            return self.on_copy_review_key(key);
         }
         if self.duplicate.is_some() {
             return self.on_duplicate_key(key);
@@ -1005,12 +1030,15 @@ impl App {
             KeyCode::Char('d') => self.open_duplicate(),
             KeyCode::Char('D') => self.ask_delete(),
             KeyCode::Char('i') if self.pane == Pane::Vaults => self.open_info(),
+            KeyCode::Char('h') => {
+                self.help = true;
+                None
+            },
             KeyCode::Char('P') => {
                 self.open_proxy_editor();
                 None
             },
             KeyCode::Char('C') if self.pane == Pane::Secrets => self.open_copy_vault(),
-            KeyCode::Char('V') if self.pane == Pane::Secrets => self.open_copy(),
             KeyCode::Char('c') => self.copy_value(),
             KeyCode::Char('y') => self.selected_secret().map(|secret| Action::Copy(secret.name.clone())),
             KeyCode::Char('Y') if self.pane == Pane::Secrets => self.copy_names(),
@@ -1048,7 +1076,7 @@ impl App {
             return None;
         }
         match key.code {
-            KeyCode::Char('/') if picker.kind == PickerKind::Profiles => {
+            KeyCode::Char('/') => {
                 picker.filtering = true;
                 picker.filter.clear();
                 picker.selected = 0;
@@ -1056,7 +1084,6 @@ impl App {
             },
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.picker = None;
-                self.copy_source = None;
                 self.copy_refreshing = false;
                 None
             },
@@ -1120,11 +1147,7 @@ impl App {
             },
             PickerKind::CopyVault => {
                 let dest = self.copy_vaults.get(value?)?.clone();
-                if let Some(source) = self.copy_source.take() {
-                    return self.start_copy_vault(source, dest);
-                }
-                let name = self.selected_secret()?.name.clone();
-                self.start_copy(dest, &name)
+                self.ask_copy_vault(dest)
             },
         }
     }
@@ -1267,7 +1290,7 @@ impl App {
         self.revealed = false;
         self.pending_edit = None;
         self.pending_copy = None;
-        self.pending_copy_to = None;
+        self.copy_review = None;
         self.load_secrets()
     }
 
@@ -1582,10 +1605,6 @@ impl App {
                 self.newline_in_value();
                 return None;
             },
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.newline_in_value();
-                return None;
-            },
             KeyCode::Enter => return self.save_editor(),
             KeyCode::Down | KeyCode::Tab => {
                 if let Some(editor) = self.editor.as_mut() {
@@ -1614,6 +1633,13 @@ impl App {
     pub fn info_vault(&self) -> Option<&Vault> {
         let url = self.info_url.as_ref()?;
         self.vaults.iter().find(|vault| &vault.url == url)
+    }
+
+    fn on_help_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h')) {
+            self.help = false;
+        }
+        None
     }
 
     fn open_info(&mut self) -> Option<Action> {
@@ -1738,7 +1764,7 @@ impl App {
     fn apply_proxy(&mut self) -> Option<Action> {
         let editor = self.proxy_editor.as_ref()?;
         if !editor.enabled {
-            self.proxy = None;
+            self.set_proxy(None);
             self.proxy_editor = None;
             self.status = "proxy disabled".into();
             return self.reload_after_proxy();
@@ -1855,27 +1881,16 @@ impl App {
         Some(Action::SaveSecret { profile, vault, secret, updated: expected_updated, patch })
     }
 
-    fn open_copy(&mut self) -> Option<Action> {
-        self.copy_source = None;
-        if self.selected_secret().is_none() {
-            self.status = "select a secret first".into();
+    fn open_copy_vault(&mut self) -> Option<Action> {
+        if self.vault().is_none() {
+            self.status = "select a vault first".into();
             return None;
         }
         self.copy_targets()
     }
 
-    fn open_copy_vault(&mut self) -> Option<Action> {
-        let Some(source) = self.vault() else {
-            self.status = "select a vault first".into();
-            return None;
-        };
-        self.copy_source = Some(source);
-        self.copy_targets()
-    }
-
     fn copy_targets(&mut self) -> Option<Action> {
         if self.subscriptions.is_empty() {
-            self.copy_source = None;
             self.status = "no subscriptions in this profile".into();
             return None;
         }
@@ -1920,12 +1935,10 @@ impl App {
     }
 
     fn show_copy_vaults(&mut self, vaults: Vec<Vault>) {
-        let current =
-            self.copy_source.as_ref().map(|vault| vault.url.clone()).or_else(|| self.vault().map(|vault| vault.url));
+        let current = self.vault().map(|vault| vault.url.clone());
         self.copy_vaults = vaults.into_iter().filter(|vault| Some(&vault.url) != current.as_ref()).collect();
         if self.copy_vaults.is_empty() {
             self.picker = None;
-            self.copy_source = None;
             self.status = "no other vaults in this subscription".into();
             return;
         }
@@ -1951,67 +1964,65 @@ impl App {
         Some(Action::LoadCopyVaults { profile, subscription })
     }
 
-    fn start_copy(&mut self, dest: Vault, name: &str) -> Option<Action> {
-        let profile = self.profile()?.clone();
-        let meta = self.secrets.iter().find(|secret| secret.name == name)?.clone();
-        let value = match self.values.get(name) {
-            Some(Ok(value)) => value.clone(),
-            Some(Err(err)) => {
-                self.status = format!("error: {err}");
-                return None;
-            },
-            None => {
-                self.pending_copy_to = Some((name.to_string(), dest));
-                self.status = "fetching value...".into();
-                return self.preview();
-            },
-        };
-        if self.vault().is_some_and(|vault| vault.url == dest.url) {
-            self.status = "destination is the current vault".into();
-            return None;
-        }
-        let secret = Secret {
-            name: meta.name,
-            value,
-            content_type: meta.content_type,
-            tags: meta.tags,
-            enabled: meta.enabled,
-            expires: meta.expires,
-            not_before: meta.not_before,
-        };
-        Some(Action::CopyToVault { profile, dest, secret, overwrite: false })
-    }
-
-    fn start_copy_vault(&mut self, source: Vault, dest: Vault) -> Option<Action> {
+    /// Check the destination first so existing secrets can be reviewed one by one.
+    fn ask_copy_vault(&mut self, dest: Vault) -> Option<Action> {
+        let source = self.vault()?.clone();
         if source.url == dest.url {
             self.status = "destination is the source vault".into();
             return None;
         }
         let profile = self.profile()?.clone();
         self.loading = true;
-        self.status = if self.secret_filter.is_empty() {
-            format!("copying all secrets to {}...", dest.name)
-        } else {
-            format!("copying secrets matching [{}] to {}...", self.secret_filter, dest.name)
-        };
-        let filter = self.secret_filter.clone();
-        Some(Action::CopyVault { profile, source, dest, filter })
+        self.status = format!("checking {}...", dest.name);
+        Some(Action::PlanCopyVault { profile, source, dest, filter: self.secret_filter.clone() })
     }
 
-    fn on_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
+    fn on_copy_review_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let review = self.copy_review.as_mut()?;
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let (dest, secret) = self.confirm_overwrite.take()?;
-                let profile = self.profile()?.clone();
-                Some(Action::CopyToVault { profile, dest, secret, overwrite: true })
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                review.yes = !review.yes;
+                None
             },
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.confirm_overwrite = None;
+            KeyCode::Enter => {
+                let name = review.queue.pop_front()?;
+                if review.yes {
+                    review.plan.overwrite.push(name);
+                } else {
+                    review.plan.skip.push(name);
+                }
+                review.yes = false;
+                self.next_conflict()
+            },
+            KeyCode::Esc => {
+                self.copy_review = None;
                 self.status = "copy cancelled".into();
                 None
             },
             _ => None,
         }
+    }
+
+    /// Asks about the next undecided conflict, or starts the copy when done.
+    fn next_conflict(&mut self) -> Option<Action> {
+        let review = self.copy_review.as_ref()?;
+        let Some(name) = review.current().map(str::to_string) else {
+            let review = self.copy_review.take()?;
+            return self.run_copy_vault(review);
+        };
+        self.status = format!("'{name}' already exists in {}", review.dest.name);
+        None
+    }
+
+    fn run_copy_vault(&mut self, review: CopyReview) -> Option<Action> {
+        let profile = self.profile()?.clone();
+        self.loading = true;
+        self.status = format!(
+            "copying {} secrets to {}...",
+            review.plan.create.len() + review.plan.overwrite.len(),
+            review.dest.name
+        );
+        Some(Action::CopyVault { profile, source: review.source, dest: review.dest, plan: review.plan })
     }
 
     fn reset_views(&mut self) {
@@ -2025,8 +2036,7 @@ impl App {
         self.revealed = false;
         self.pending_copy = None;
         self.pending_edit = None;
-        self.pending_copy_to = None;
-        self.copy_source = None;
+        self.copy_review = None;
         self.copy_refreshing = false;
         self.info_cache.clear();
         self.duplicate = None;
@@ -3084,21 +3094,6 @@ mod tests {
     }
 
     #[test]
-    fn editor_inserts_a_newline_with_ctrl_j() {
-        let mut app = loaded_app();
-        with_vaults(&mut app);
-        with_secrets(&mut app, &["alpha"]);
-        app.values.insert("alpha".into(), Ok(String::new()));
-        app.pane = Pane::Secrets;
-        app.on_key(key(KeyCode::Char('e')));
-
-        app.on_key(key(KeyCode::Char('a')));
-        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
-        app.on_key(key(KeyCode::Char('b')));
-        assert_eq!(app.editor.as_ref().unwrap().field(0).text(), "a\nb");
-    }
-
-    #[test]
     fn new_secret_pastes_a_multiline_certificate_into_value() {
         let mut app = loaded_app();
         with_vaults(&mut app);
@@ -3344,12 +3339,12 @@ mod tests {
     }
 
     #[test]
-    fn copy_to_vault_asks_for_a_subscription_then_loads_vaults() {
+    fn copy_to_another_subscription_loads_its_vaults() {
         let mut app = loaded_app();
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Secrets;
-        assert!(app.on_key(key(KeyCode::Char('V'))).is_none());
+        assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
         let picker = app.picker.as_ref().unwrap();
         assert_eq!(picker.kind, PickerKind::CopySubscription);
         assert_eq!(picker.items.len(), 2);
@@ -3374,7 +3369,7 @@ mod tests {
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Secrets;
-        assert!(app.on_key(key(KeyCode::Char('V'))).is_none());
+        assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
         let picker = app.picker.as_ref().unwrap();
         assert_eq!(picker.kind, PickerKind::CopyVault);
         assert_eq!(picker.items, vec!["kv-b  (prod)".to_string()]);
@@ -3387,7 +3382,7 @@ mod tests {
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Secrets;
-        assert!(app.on_key(key(KeyCode::Char('V'))).is_none());
+        assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
         assert_eq!(app.picker.as_ref().unwrap().kind, PickerKind::CopySubscription);
         assert!(app.on_key(key(KeyCode::Enter)).is_none());
         let picker = app.picker.as_ref().unwrap();
@@ -3402,7 +3397,7 @@ mod tests {
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
         app.pane = Pane::Secrets;
-        app.on_key(key(KeyCode::Char('V')));
+        app.on_key(key(KeyCode::Char('C')));
         app.on_key(key(KeyCode::Enter));
         let action = app.on_key(key(KeyCode::Char('r'))).unwrap();
         assert!(matches!(action, Action::LoadVaults { .. }));
@@ -3426,7 +3421,6 @@ mod tests {
         let mut app = loaded_app();
         with_vaults(&mut app);
         with_secrets(&mut app, &["alpha"]);
-        app.values.insert("alpha".into(), Ok("secret".into()));
         let subscription = app.subscription().unwrap();
         app.copy_sub = Some(subscription.clone());
         app.handle(Msg::CopyVaults {
@@ -3437,13 +3431,136 @@ mod tests {
         assert_eq!(picker.kind, PickerKind::CopyVault);
         assert_eq!(picker.items, vec!["kv-b  (prod)".to_string()]);
         let action = app.on_key(key(KeyCode::Enter)).unwrap();
-        let Action::CopyToVault { dest, secret, overwrite, .. } = action else {
-            panic!("expected CopyToVault");
+        assert!(matches!(action, Action::PlanCopyVault { .. }), "got {action:?}");
+
+        assert!(app.loading);
+        assert_eq!(app.status, "checking kv-b...");
+    }
+
+    #[test]
+    fn copy_vault_picker_is_filterable() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+        let subscription = app.subscription().unwrap();
+        app.copy_sub = Some(subscription.clone());
+        app.handle(Msg::CopyVaults {
+            subscription_id: subscription.id.clone(),
+            result: Ok(vec![vault("kv-a", &subscription), vault("kv-b", &subscription), vault("kv-c", &subscription)]),
+        });
+        assert!(app.on_key(key(KeyCode::Char('/'))).is_none());
+        for character in "kv-c".chars() {
+            app.on_key(key(KeyCode::Char(character)));
+        }
+        assert_eq!(app.picker.as_ref().unwrap().visible(), vec![1]);
+        assert!(app.on_key(key(KeyCode::Enter)).is_none(), "enter keeps the filter");
+        let action = app.on_key(key(KeyCode::Enter)).unwrap();
+        assert!(matches!(action, Action::PlanCopyVault { .. }), "got {action:?}");
+        assert_eq!(app.status, "checking kv-c...");
+    }
+
+    #[test]
+    fn existing_secrets_are_reviewed_one_by_one() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+        let subscription = app.subscription().unwrap();
+        app.copy_sub = Some(subscription.clone());
+        app.handle(Msg::CopyVaults {
+            subscription_id: subscription.id.clone(),
+            result: Ok(vec![vault("kv-b", &subscription)]),
+        });
+        app.on_key(key(KeyCode::Enter));
+
+        let source = app.vault().unwrap();
+        app.handle(Msg::CopyPlan {
+            source,
+            dest: vault("kv-b", &subscription),
+            result: Ok(CopyPlan {
+                create: vec!["gamma".into()],
+                overwrite: vec![],
+                skip: vec!["alpha".into(), "beta".into()],
+            }),
+        });
+        assert!(!app.loading);
+        assert_eq!(app.status, "'alpha' already exists in kv-b");
+        let review = app.copy_review.as_ref().unwrap();
+        assert_eq!((review.position(), review.total), (1, 2));
+        assert!(!review.yes, "No is focused by default");
+
+        // Enter on the default focus skips alpha.
+        assert!(app.on_key(key(KeyCode::Enter)).is_none());
+        assert_eq!(app.status, "'beta' already exists in kv-b");
+        assert_eq!(app.copy_review.as_ref().unwrap().position(), 2);
+        assert!(!app.copy_review.as_ref().unwrap().yes, "focus resets to No");
+
+        // Focus Yes, then confirm: beta is overwritten.
+        assert!(app.on_key(key(KeyCode::Right)).is_none());
+        assert!(app.copy_review.as_ref().unwrap().yes);
+        let action = app.on_key(key(KeyCode::Enter)).unwrap();
+        let Action::CopyVault { source, dest, plan, .. } = action else {
+            panic!("expected CopyVault, got {action:?}");
         };
+        assert_eq!(source.name, "kv-a");
         assert_eq!(dest.name, "kv-b");
-        assert_eq!(secret.name, "alpha");
-        assert_eq!(secret.value, "secret");
-        assert!(!overwrite);
+        assert_eq!(plan.create, vec!["gamma"]);
+        assert_eq!(plan.overwrite, vec!["beta"]);
+        assert_eq!(plan.skip, vec!["alpha"]);
+        assert!(app.copy_review.is_none());
+        assert_eq!(app.status, "copying 2 secrets to kv-b...");
+    }
+
+    #[test]
+    fn copy_without_conflicts_starts_immediately() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+        let subscription = app.subscription().unwrap();
+        let source = app.vault().unwrap();
+        let action = app.handle(Msg::CopyPlan {
+            source,
+            dest: vault("kv-b", &subscription),
+            result: Ok(CopyPlan { create: vec!["alpha".into()], ..Default::default() }),
+        });
+        let Some(Action::CopyVault { plan, .. }) = action else {
+            panic!("expected CopyVault");
+        };
+        assert_eq!(plan.create, vec!["alpha"]);
+        assert!(app.copy_review.is_none());
+    }
+
+    #[test]
+    fn copy_review_esc_cancels_the_whole_copy() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+        let subscription = app.subscription().unwrap();
+        let source = app.vault().unwrap();
+        app.handle(Msg::CopyPlan {
+            source,
+            dest: vault("kv-b", &subscription),
+            result: Ok(CopyPlan { skip: vec!["alpha".into()], ..Default::default() }),
+        });
+        assert!(app.copy_review.is_some());
+        assert!(app.on_key(key(KeyCode::Esc)).is_none());
+        assert!(app.copy_review.is_none());
+        assert!(app.status.contains("cancelled"));
+    }
+
+    #[test]
+    fn copy_of_existing_secrets_reports_overwrites() {
+        let mut app = loaded_app();
+        let dest = vault("kv-b", &app.subscription().unwrap());
+        app.handle(Msg::CopiedVault {
+            source: "kv-a".into(),
+            dest: dest.name.clone(),
+            result: Ok(azkv_core::copy::CopyReport {
+                created: vec!["alpha".into()],
+                overwritten: vec!["beta".into()],
+                ..Default::default()
+            }),
+        });
+        assert_eq!(app.status, "copied 2 secrets to kv-b, 1 overwritten");
     }
 
     #[test]
@@ -3458,7 +3575,7 @@ mod tests {
         app.pane = Pane::Secrets;
         assert!(app.on_key(key(KeyCode::Char('C'))).is_none());
         assert_eq!(app.picker.as_ref().unwrap().kind, PickerKind::CopySubscription);
-        assert_eq!(app.copy_source.as_ref().unwrap().name, "kv-a");
+        assert_eq!(app.vault().unwrap().name, "kv-a");
 
         let subscription = app.subscription().unwrap();
         app.copy_sub = Some(subscription.clone());
@@ -3469,13 +3586,30 @@ mod tests {
         assert_eq!(app.picker.as_ref().unwrap().kind, PickerKind::CopyVault);
 
         let action = app.on_key(key(KeyCode::Enter)).unwrap();
-        let Action::CopyVault { source, dest, .. } = action else {
+        assert!(matches!(action, Action::PlanCopyVault { .. }), "got {action:?}");
+        let source = app.vault().unwrap();
+        let dest = vault("kv-b", &subscription);
+        let action = app.handle(Msg::CopyPlan {
+            source,
+            dest,
+            result: Ok(CopyPlan {
+                create: vec!["alpha".into(), "beta".into()],
+                skip: vec!["gamma".into()],
+                ..Default::default()
+            }),
+        });
+        assert!(action.is_none(), "conflicts are reviewed before copying");
+        assert_eq!(app.status, "'gamma' already exists in kv-b");
+
+        let action = app.on_key(key(KeyCode::Enter)).unwrap();
+        let Action::CopyVault { source, dest, plan, .. } = action else {
             panic!("expected CopyVault, got {action:?}");
         };
         assert_eq!(source.name, "kv-a");
         assert_eq!(dest.name, "kv-b");
-        assert!(app.copy_source.is_none());
-        assert_eq!(app.status, "copying all secrets to kv-b...");
+        assert_eq!(plan.create, vec!["alpha", "beta"]);
+        assert_eq!(plan.skip, vec!["gamma"]);
+        assert_eq!(app.status, "copying 2 secrets to kv-b...");
 
         app.handle(Msg::CopiedVault {
             source: "kv-a".into(),
@@ -3505,12 +3639,13 @@ mod tests {
             result: Ok(vec![vault("kv-a", &subscription), vault("kv-b", &subscription)]),
         });
         let action = app.on_key(key(KeyCode::Enter)).unwrap();
-        let Action::CopyVault { filter, dest, .. } = action else {
-            panic!("expected CopyVault, got {action:?}");
+        let Action::PlanCopyVault { filter, dest, .. } = action else {
+            panic!("expected PlanCopyVault, got {action:?}");
         };
         assert_eq!(filter, "db|api");
         assert_eq!(dest.name, "kv-b");
-        assert_eq!(app.status, "copying secrets matching [db|api] to kv-b...");
+        assert!(app.loading);
+        assert_eq!(app.status, "checking kv-b...");
     }
 
     #[test]
@@ -3525,38 +3660,26 @@ mod tests {
                 ..Default::default()
             }),
         });
-        assert!(app.status.starts_with("copy failed: 1 of 2"));
+        assert_eq!(app.status, "copy failed: denied (1 of 2 secrets, 1 copied, 0 skipped)");
     }
 
     #[test]
-    fn copying_without_a_cached_value_fetches_then_continues() {
+    fn copy_failure_explains_soft_deleted_and_points_to_the_log() {
         let mut app = loaded_app();
-        with_vaults(&mut app);
-        with_secrets(&mut app, &["alpha"]);
-        let subscription = app.subscription().unwrap();
-        app.copy_sub = Some(subscription.clone());
-        app.handle(Msg::CopyVaults {
-            subscription_id: subscription.id.clone(),
-            result: Ok(vec![vault("kv-b", &subscription)]),
+        app.handle(Msg::CopiedVault {
+            source: "kv-a".into(),
+            dest: "kv-b".into(),
+            result: Ok(azkv_core::copy::CopyReport {
+                skipped: vec!["alpha".into(), "beta".into(), "gamma".into()],
+                failed: vec![
+                    ("db".into(), "destination secret 'db' is soft-deleted: recover or purge it".into()),
+                    ("api".into(), "denied".into()),
+                ],
+                ..Default::default()
+            }),
         });
-        let action = app.on_key(key(KeyCode::Enter)).unwrap();
-        assert!(matches!(action, Action::FetchValue { ref name, .. } if name == "alpha"));
-        assert!(app.pending_copy_to.is_some());
-        let url = app.vault().unwrap().url;
-        let action = app.handle(Msg::Value { url, name: "alpha".into(), result: Ok("later".into()) }).unwrap();
-        let Action::CopyToVault { secret, .. } = action else {
-            panic!("expected CopyToVault");
-        };
-        assert_eq!(secret.value, "later");
-        assert!(app.pending_copy_to.is_none());
-    }
-
-    #[test]
-    fn stale_copy_vault_responses_are_ignored() {
-        let mut app = loaded_app();
-        app.copy_sub = Some(app.subscriptions[0].clone());
-        assert!(app.handle(Msg::CopyVaults { subscription_id: "s2".into(), result: Ok(vec![]) }).is_none());
-        assert!(app.picker.is_none());
+        assert!(app.status.starts_with("copy failed: destination secret 'db' is soft-deleted"));
+        assert!(app.status.ends_with("(2 of 5 secrets, 0 copied, 3 skipped) (+1 more, see log)"));
     }
 
     #[test]
@@ -3566,54 +3689,42 @@ mod tests {
         with_secrets(&mut app, &["alpha"]);
         app.pending_edit = Some("alpha".into());
         app.pending_copy = Some("alpha".into());
-        app.pending_copy_to = Some(("alpha".into(), app.vaults[1].clone()));
+        app.copy_review = Some(CopyReview {
+            source: app.vaults[0].clone(),
+            dest: app.vaults[1].clone(),
+            plan: CopyPlan::default(),
+            queue: VecDeque::from(["alpha".to_string()]),
+            total: 1,
+            yes: false,
+        });
 
         app.open_vault();
         assert!(app.pending_edit.is_none());
         assert!(app.pending_copy.is_none());
-        assert!(app.pending_copy_to.is_none());
+        assert!(app.copy_review.is_none());
 
         app.pending_edit = Some("alpha".into());
         app.pending_copy = Some("alpha".into());
-        app.pending_copy_to = Some(("alpha".into(), app.vaults[1].clone()));
+        app.copy_review = Some(CopyReview {
+            source: app.vaults[0].clone(),
+            dest: app.vaults[1].clone(),
+            plan: CopyPlan::default(),
+            queue: VecDeque::from(["alpha".to_string()]),
+            total: 1,
+            yes: false,
+        });
         app.reset_views();
         assert!(app.pending_edit.is_none());
         assert!(app.pending_copy.is_none());
-        assert!(app.pending_copy_to.is_none());
+        assert!(app.copy_review.is_none());
     }
 
     #[test]
-    fn existing_destination_asks_before_overwriting() {
+    fn stale_copy_vault_responses_are_ignored() {
         let mut app = loaded_app();
-        with_vaults(&mut app);
-        with_secrets(&mut app, &["alpha"]);
-        let dest = vault("kv-b", &app.subscription().unwrap());
-        let secret = Secret {
-            name: "alpha".into(),
-            value: "new".into(),
-            content_type: None,
-            tags: Default::default(),
-            enabled: true,
-            expires: None,
-            not_before: None,
-        };
-        app.handle(Msg::CopyToExists { dest, secret });
-        assert!(app.confirm_overwrite.is_some());
-        assert!(app.status.contains("exists"));
-        assert!(app.on_key(key(KeyCode::Char('q'))).is_none());
-        let action = app.on_key(key(KeyCode::Char('y'))).unwrap();
-        let Action::CopyToVault { dest, secret, overwrite, .. } = action else {
-            panic!("expected CopyToVault");
-        };
-        assert_eq!(dest.name, "kv-b");
-        assert_eq!(secret.value, "new");
-        assert!(overwrite);
-        assert!(app.confirm_overwrite.is_none());
-
-        app.handle(Msg::CopyToExists { dest, secret });
-        assert!(app.on_key(key(KeyCode::Char('n'))).is_none());
-        assert!(app.confirm_overwrite.is_none());
-        assert!(app.status.contains("cancelled"));
+        app.copy_sub = Some(app.subscriptions[0].clone());
+        assert!(app.handle(Msg::CopyVaults { subscription_id: "s2".into(), result: Ok(vec![]) }).is_none());
+        assert!(app.picker.is_none());
     }
 
     #[test]
@@ -3921,6 +4032,33 @@ mod tests {
     }
 
     #[test]
+    fn help_opens_for_every_pane_and_swallows_pane_keys() {
+        let mut app = loaded_app();
+        with_vaults(&mut app);
+        with_secrets(&mut app, &["alpha"]);
+
+        assert!(app.on_key(key(KeyCode::Char('h'))).is_none());
+        assert!(app.help);
+        assert!(app.info_url.is_none(), "h shows shortcuts, not vault details");
+        assert_eq!(app.pane, Pane::Vaults);
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.pane, Pane::Vaults, "keys behind the overlay are inert");
+        app.on_key(key(KeyCode::Esc));
+        assert!(!app.help);
+
+        app.pane = Pane::Secrets;
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.help);
+        app.on_key(key(KeyCode::Char('q')));
+        assert!(!app.help, "q closes the overlay instead of quitting");
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(app.help, "h opens the overlay again");
+        app.on_key(key(KeyCode::Char('h')));
+        assert!(!app.help, "h toggles the overlay off");
+        assert_eq!(app.pane, Pane::Secrets);
+    }
+
+    #[test]
     fn info_is_not_opened_from_the_secrets_pane() {
         let mut app = loaded_app();
         with_vaults(&mut app);
@@ -4035,15 +4173,6 @@ mod tests {
         assert!(!app.show_hints);
         app.on_key(ctrl_e);
         assert!(app.show_hints);
-    }
-
-    #[test]
-    fn copied_to_success_and_failure_are_reported() {
-        let mut app = loaded_app();
-        app.handle(Msg::CopiedTo { dest: "kv-b".into(), name: "alpha".into(), result: Ok(()) });
-        assert_eq!(app.status, "copied 'alpha' to kv-b");
-        app.handle(Msg::CopiedTo { dest: "kv-b".into(), name: "alpha".into(), result: Err("denied".into()) });
-        assert!(app.status.contains("denied"));
     }
 
     #[test]

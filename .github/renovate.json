@@ -15,6 +15,12 @@
   },
   "packageRules": [
     {
+      "description": "GitHub Actions: upgrade once a month, on the 1st",
+      "matchManagers": ["github-actions"],
+      "schedule": ["* * 1 * *"],
+      "updateNotScheduled": false
+    },
+    {
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "matchCurrentVersion": "!/^0\\./",
       "groupName": "minor and patch updates",

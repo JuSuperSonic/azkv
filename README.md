@@ -33,8 +33,7 @@ Basic keys:
 | `e` | Edit secret |
 | `d` | Duplicate secret |
 | `D` | Delete secret |
-| `C` | Copy matching secrets (all or filtered) |
-| `V` | Copy selected secret to another vault |
+| `C` | Copy secrets to another vault (all or filtered) |
 | `i` | Vault info |
 | `P` | Configure proxy |
 | `r` | Refresh |
@@ -57,6 +56,9 @@ Run `azkvctl --help` for all commands.
 Both binaries accept `--proxy` and `--no-proxy`, or the `AZKV_PROXY` and
 `AZKV_NO_PROXY` environment variables. They also honour the usual proxy
 environment variables.
+
+`azkv info` shows the version and the log location; startup logs the
+transport actually in use.
 
 ## Tests
 
