@@ -29,9 +29,7 @@ impl ProxySettings {
         let Some(proxy) = proxy.map(str::trim).filter(|proxy| !proxy.is_empty()) else {
             return Ok(None);
         };
-        // Bare `host:port` is the ssh -D case; HTTP proxies need an explicit scheme.
         let proxy = if proxy.contains("://") { proxy.to_string() } else { format!("socks5h://{proxy}") };
-        // An explicit --no-proxy wins; otherwise honour the usual env vars.
         let no_proxy =
             no_proxy.map(str::trim).filter(|no_proxy| !no_proxy.is_empty()).map(str::to_string).or_else(env_no_proxy);
         let matcher = no_proxy.as_deref().and_then(reqwest::NoProxy::from_string);
@@ -66,7 +64,6 @@ impl ProxySettings {
         &self.proxy
     }
 
-    /// The proxy URL without credentials, for status text and error messages.
     pub fn display_url(&self) -> String {
         redact_url(&self.proxy)
     }
@@ -173,6 +170,35 @@ mod tests {
         drop(listener);
         let settings = ProxySettings::new(Some(&format!("socks5h://127.0.0.1:{port}")), None).unwrap().unwrap();
         assert!(settings.check().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn check_speaks_socks5_to_the_proxy() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let greeting = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    },
+                    Err(err) => panic!("no socks connection: {err}"),
+                }
+            };
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut bytes = [0u8; 3];
+            std::io::Read::read_exact(&mut socket, &mut bytes).unwrap();
+            bytes
+        });
+        let settings = ProxySettings::new(Some(&format!("socks5h://{addr}")), None).unwrap().unwrap();
+        // The fake proxy never answers, so the probe fails after the greeting.
+        assert!(settings.check().await.is_err());
+        assert_eq!(greeting.join().unwrap(), [0x05, 0x01, 0x00]);
     }
 
     #[test]
