@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::app::{Action, Msg, matches};
+use crate::error::short;
 use anyhow::{Result, bail};
 use azkv_core::arm::Arm;
 use azkv_core::copy::{DEFAULT_CONCURRENCY, execute_copy, plan};
@@ -9,9 +11,7 @@ use azkv_core::credential::AzAuth;
 use azkv_core::vault::KvVault;
 use azkv_core::{Profile, ProxySettings, Secret, SecretMeta, SecretStore, clipboard, is_not_found};
 use tokio::sync::mpsc::UnboundedSender;
-
-use crate::app::{Action, Msg, matches};
-use crate::error::short;
+use tracing::{info, warn};
 
 pub type AuthCache = HashMap<PathBuf, Arc<AzAuth>>;
 
@@ -43,7 +43,7 @@ pub fn execute(
                         .await
                         .inspect(|overview| {
                             for warning in &overview.warnings {
-                                tracing::warn!("{warning}");
+                                warn!("{warning}");
                             }
                         })
                         .map_err(short),
@@ -104,7 +104,6 @@ pub fn execute(
                     Ok(client) => save_secret(&client, &secret, updated, patch).await.map_err(short),
                     Err(err) => Err(short(err)),
                 };
-                // An attributes-only save never read the value.
                 let value = (!patch).then(|| secret.value.clone());
                 let _ = tx.send(Msg::Saved { url: vault.url, name: secret.name, value, result });
             });
@@ -160,32 +159,10 @@ pub fn execute(
                 let _ = tx.send(Msg::Deleted { url: vault.url, name, result });
             });
         },
-        Action::CopyToVault { profile, dest, secret, overwrite } => {
+        Action::PlanCopyVault { profile, source, dest, filter } => {
             let auth = auth_for(&profile, auths);
             let tx = tx.clone();
             tokio::spawn(async move {
-                let dest_name = dest.name.clone();
-                let name = secret.name.clone();
-                let result = check_and_copy(&dest, &auth, proxy.as_ref(), secret, overwrite).await;
-                match result {
-                    Ok(Some(secret)) => {
-                        let _ = tx.send(Msg::CopyToExists { dest, secret });
-                    },
-                    Ok(None) => {
-                        let _ = tx.send(Msg::CopiedTo { dest: dest_name, name, result: Ok(()) });
-                    },
-                    Err(err) => {
-                        let _ = tx.send(Msg::CopiedTo { dest: dest_name, name, result: Err(short(err)) });
-                    },
-                }
-            });
-        },
-        Action::CopyVault { profile, source, dest, filter } => {
-            let auth = auth_for(&profile, auths);
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let source_name = source.name.clone();
-                let dest_name = dest.name.clone();
                 let result = async {
                     let source_client = KvVault::for_vault(&source, &auth, proxy.as_ref())?;
                     let dest_client = KvVault::for_vault(&dest, &auth, proxy.as_ref())?;
@@ -198,36 +175,44 @@ pub fn execute(
                         .filter(|name| matches(name, &filter))
                         .collect::<Vec<_>>();
                     let existing = dest_client.names().await?.into_iter().collect();
-                    let plan = plan(&names, &existing, false);
+                    Ok::<_, anyhow::Error>(plan(&names, &existing, false))
+                }
+                .await
+                .map_err(short);
+                let _ = tx.send(Msg::CopyPlan { source, dest, result });
+            });
+        },
+        Action::CopyVault { profile, source, dest, plan } => {
+            let auth = auth_for(&profile, auths);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let source_name = source.name.clone();
+                let dest_name = dest.name.clone();
+                let result = async {
+                    info!(
+                        "copy {} -> {}: {} new, {} to overwrite, {} to skip",
+                        source.name,
+                        dest.name,
+                        plan.create.len(),
+                        plan.overwrite.len(),
+                        plan.skip.len()
+                    );
+                    let source_client = KvVault::for_vault(&source, &auth, proxy.as_ref())?;
+                    let dest_client = KvVault::for_vault(&dest, &auth, proxy.as_ref())?;
                     Ok::<_, anyhow::Error>(execute_copy(&source_client, &dest_client, &plan, DEFAULT_CONCURRENCY).await)
                 }
                 .await
                 .map_err(short);
+                if let Ok(report) = &result {
+                    for (name, message) in &report.failed {
+                        warn!("copy to {}: '{name}' failed: {message}", dest_name);
+                    }
+                }
                 let _ = tx.send(Msg::CopiedVault { source: source_name, dest: dest_name, result });
             });
         },
     }
     false
-}
-
-/// Returns the secret when the destination already has it and overwrite is off.
-async fn check_and_copy(
-    dest: &azkv_core::Vault,
-    auth: &Arc<AzAuth>,
-    proxy: Option<&ProxySettings>,
-    secret: Secret,
-    overwrite: bool,
-) -> Result<Option<Secret>> {
-    let client = KvVault::for_vault(dest, auth, proxy)?;
-    if !overwrite {
-        match client.get(&secret.name).await {
-            Ok(_) => return Ok(Some(secret)),
-            Err(err) if is_not_found(&err) => {},
-            Err(err) => return Err(err.into()),
-        }
-    }
-    client.put(&secret).await?;
-    Ok(None)
 }
 
 /// Writes a secret after checking that a create is new or an edit is still current.
@@ -243,7 +228,6 @@ async fn save_secret(
             Err(err) if is_not_found(&err) => {},
             Err(err) => return Err(err.into()),
         },
-        // Disabled secrets cannot be read, so compare the listed metadata.
         Some(expected) if patch => {
             let Some(meta) = client.meta_of(&secret.name).await? else {
                 bail!("secret '{}' not found", secret.name);

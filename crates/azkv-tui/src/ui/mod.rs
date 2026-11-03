@@ -42,4 +42,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(confirm) = &app.confirm_delete {
         dialogs::draw_delete_confirm(frame, confirm);
     }
+    if let Some(review) = &app.copy_review {
+        dialogs::draw_copy_review(frame, review);
+    }
+    if app.help {
+        dialogs::draw_help(frame, app);
+    }
 }
