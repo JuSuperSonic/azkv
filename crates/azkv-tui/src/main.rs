@@ -7,14 +7,18 @@ mod ui;
 use anyhow::{Result, bail};
 use azkv_core::profiles;
 use azkv_core::{Profile, ProxySettings};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::{
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    time::timeout,
+};
+use tracing::info;
 
 use crate::actions::{AuthCache, execute as run_action};
 use crate::app::{Action, App, Msg};
@@ -33,11 +37,34 @@ struct Cli {
     /// Hosts that bypass --proxy (default: NO_PROXY env)
     #[arg(long, env = "AZKV_NO_PROXY")]
     no_proxy: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Info,
+    Version,
 }
 
 fn main() -> Result<()> {
     logging::init_logging();
     let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Version) => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        },
+        Some(Command::Info) => {
+            let log =
+                logging::log_path().map(|path| path.display().to_string()).unwrap_or_else(|| "unavailable".into());
+            println!("Version:           {}", env!("CARGO_PKG_VERSION"));
+            println!("Logs:              {log}");
+            return Ok(());
+        },
+        None => {},
+    }
     let mut profiles = profiles::discover().unwrap_or_default();
     let selected = match &cli.profile {
         Some(spec) => {
@@ -59,6 +86,12 @@ fn main() -> Result<()> {
         bail!("no Azure CLI profiles found; run `az login` first");
     }
     let proxy = ProxySettings::new(cli.proxy.as_deref(), cli.no_proxy.as_deref())?;
+    match &proxy {
+        Some(proxy) => {
+            info!("proxy {} (no_proxy: {})", proxy.display_url(), proxy.no_proxy().unwrap_or("none"))
+        },
+        None => info!("no proxy: direct transport (set --proxy or use P)"),
+    }
 
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run(profiles, selected, proxy))
 }
@@ -101,7 +134,7 @@ async fn event_loop(
         }
         let msg = if app.loading {
             // Redraw while loading so the spinner animates.
-            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+            match timeout(std::time::Duration::from_millis(100), rx.recv()).await {
                 Ok(msg) => msg,
                 Err(_) => continue,
             }
@@ -113,9 +146,9 @@ async fn event_loop(
         };
         *pending = app.handle(msg);
     }
+
     Ok(())
 }
-
 fn spawn_input(tx: UnboundedSender<Msg>) {
     std::thread::spawn(move || {
         while let Ok(event) = event::read() {
@@ -141,5 +174,12 @@ mod tests {
         let cli = Cli::try_parse_from(["azkv", "--proxy", "http://127.0.0.1:8080", "--no-proxy", "localhost"]).unwrap();
         assert_eq!(cli.proxy.as_deref(), Some("http://127.0.0.1:8080"));
         assert_eq!(cli.no_proxy.as_deref(), Some("localhost"));
+    }
+
+    #[test]
+    fn info_and_version_subcommands_are_parsed() {
+        assert!(matches!(Cli::try_parse_from(["azkv", "info"]).unwrap().command, Some(Command::Info)));
+        assert!(matches!(Cli::try_parse_from(["azkv", "version"]).unwrap().command, Some(Command::Version)));
+        assert!(Cli::try_parse_from(["azkv"]).unwrap().command.is_none());
     }
 }
