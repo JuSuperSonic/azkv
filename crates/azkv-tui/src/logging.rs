@@ -1,9 +1,12 @@
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::MakeWriter};
 
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 const KEEP_LOG_FILES: u32 = 3;
@@ -13,50 +16,99 @@ pub fn init_logging() {
         return;
     };
     let secure_dir = std::env::var_os("AZKV_LOG").is_none();
-    let Some(file) = open_log(&path, secure_dir) else {
+    let Some(writer) = RotatingLog::new(path, MAX_LOG_BYTES, KEEP_LOG_FILES, secure_dir) else {
         return;
     };
-    // The TUI owns the terminal, so events go to a file instead of stdout/stderr.
+
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| format!("{}=info", env!("CARGO_CRATE_NAME")));
     let _ = tracing_subscriber::fmt()
         .with_file(true)
         .with_line_number(true)
         .with_target(false)
         .with_ansi(false)
-        .with_writer(file)
+        .with_writer(writer)
         .with_env_filter(EnvFilter::builder().parse_lossy(filter))
         .try_init();
+}
+
+struct RotatingLog {
+    inner: Mutex<LogFile>,
+}
+
+struct LogFile {
+    path: PathBuf,
+    file: fs::File,
+    written: u64,
+    max_bytes: u64,
+    keep: u32,
+    secure_dir: bool,
+}
+
+impl RotatingLog {
+    fn new(path: PathBuf, max_bytes: u64, keep: u32, secure_dir: bool) -> Option<Self> {
+        let file = open_log(&path, secure_dir)?;
+        let written = file.metadata().map_or(0, |meta| meta.len());
+        Some(Self { inner: Mutex::new(LogFile { path, file, written, max_bytes, keep, secure_dir }) })
+    }
+}
+
+impl Write for LogFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.written >= self.max_bytes {
+            rotate_log(&self.path, self.max_bytes, self.keep);
+            if let Some(file) = open_log(&self.path, self.secure_dir) {
+                self.file = file;
+                self.written = 0;
+            }
+        }
+        let written = self.file.write(buf)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for RotatingLog {
+    type Writer = LogWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    }
+}
+
+struct LogWriter<'a>(MutexGuard<'a, LogFile>);
+
+impl Write for LogWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 fn open_log(path: &Path, secure_dir: bool) -> Option<fs::File> {
     if let Some(parent) = path.parent() {
         let existed = parent.exists();
         let _ = fs::create_dir_all(parent);
-        #[cfg(unix)]
         if secure_dir || !existed {
-            use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
         }
     }
     rotate_log(path, MAX_LOG_BYTES, KEEP_LOG_FILES);
     let mut options = fs::OpenOptions::new();
     options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    options.mode(0o600);
     let file = options.open(path).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    }
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+
     Some(file)
 }
 
-// shortcut: the log is rotated when it is opened, so one very long session can
-// exceed MAX_LOG_BYTES; switch to a size-checking MakeWriter if that matters.
 fn rotate_log(path: &Path, max_bytes: u64, keep: u32) {
     if fs::metadata(path).map_or(true, |meta| meta.len() < max_bytes) {
         return;
@@ -91,8 +143,6 @@ pub(crate) fn log_path() -> Option<PathBuf> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
 
     #[test]
@@ -149,6 +199,26 @@ mod tests {
         assert_eq!(fs::read_to_string(indexed(&path, 2)).unwrap(), "old1");
         assert_eq!(fs::read_to_string(indexed(&path, 3)).unwrap(), "old2");
         assert!(!indexed(&path, 4).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writer_rotates_during_a_long_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "azkv-log-writer-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("azkv.log");
+        let writer = RotatingLog::new(path.clone(), 32, KEEP_LOG_FILES, true).unwrap();
+
+        for _ in 0..10 {
+            writer.inner.lock().unwrap().write_all(&[b'x'; 8]).unwrap();
+        }
+
+        assert_eq!(fs::metadata(&path).unwrap().len(), 16);
+        assert_eq!(fs::metadata(indexed(&path, 1)).unwrap().len(), 32);
         let _ = fs::remove_dir_all(&dir);
     }
 

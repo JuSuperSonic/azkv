@@ -512,9 +512,10 @@ impl App {
         self.proxy = proxy;
     }
 
-    pub fn start(&mut self) -> Action {
+    pub fn start(&mut self) -> Option<Action> {
+        let profile = self.profile().cloned()?;
         self.loading = true;
-        Action::LoadOverview { profile: self.profile().cloned().expect("at least one profile") }
+        Some(Action::LoadOverview { profile })
     }
 
     pub fn profile(&self) -> Option<&Profile> {
@@ -2280,7 +2281,7 @@ mod tests {
     #[test]
     fn starts_by_loading_the_selected_profile() {
         let mut app = App::new(vec![profile("test")], 0);
-        assert_eq!(app.start(), Action::LoadOverview { profile: profile("test") });
+        assert_eq!(app.start(), Some(Action::LoadOverview { profile: profile("test") }));
         assert!(app.loading);
     }
 

@@ -4,24 +4,30 @@ mod error;
 mod logging;
 mod ui;
 
+use crate::actions::{AuthCache, execute as run_action};
+use crate::app::{Action, App, Msg};
 use anyhow::{Result, bail};
-use azkv_core::profiles;
-use azkv_core::{Profile, ProxySettings};
-use clap::{Parser, Subcommand};
-use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+use azkv_core::{
+    profiles, {Profile, ProxySettings},
 };
-use ratatui::crossterm::execute;
+use clap::{Parser, Subcommand};
+use libc::{SIGTSTP, raise};
+use ratatui::{
+    crossterm::{
+        event::{
+            self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        },
+        execute,
+    },
+    {DefaultTerminal, init, restore},
+};
+use std::io::stdout;
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     time::timeout,
 };
 use tracing::info;
-
-use crate::actions::{AuthCache, execute as run_action};
-use crate::app::{Action, App, Msg};
 
 #[derive(Parser)]
 #[command(name = "azkv", about = "Azure Key Vault TUI: browse, reveal and copy secrets")]
@@ -100,20 +106,37 @@ async fn run(profiles: Vec<Profile>, selected: usize, proxy: Option<ProxySetting
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(profiles, selected);
     app.set_proxy(proxy);
-    let mut pending = Some(app.start());
+    let mut pending = app.start();
     let mut auths = AuthCache::default();
 
-    let mut terminal = ratatui::init();
+    let mut terminal = enter_terminal()?;
+    spawn_input(tx.clone());
+    let result = event_loop(&mut terminal, &mut app, rx, &tx, &mut pending, &mut auths).await;
+    leave_terminal();
+    result
+}
+
+fn enter_terminal() -> Result<DefaultTerminal> {
+    let terminal = init();
     execute!(
-        std::io::stdout(),
+        stdout(),
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     )?;
-    spawn_input(tx.clone());
-    let result = event_loop(&mut terminal, &mut app, rx, &tx, &mut pending, &mut auths).await;
-    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags, DisableBracketedPaste,);
-    ratatui::restore();
-    result
+    Ok(terminal)
+}
+
+fn leave_terminal() {
+    let _ = execute!(stdout(), PopKeyboardEnhancementFlags, DisableBracketedPaste);
+    restore();
+}
+
+fn is_suspend_key(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('z') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn suspend() {
+    unsafe { raise(SIGTSTP) };
 }
 
 async fn event_loop(
@@ -133,7 +156,6 @@ async fn event_loop(
             continue;
         }
         let msg = if app.loading {
-            // Redraw while loading so the spinner animates.
             match timeout(std::time::Duration::from_millis(100), rx.recv()).await {
                 Ok(msg) => msg,
                 Err(_) => continue,
@@ -144,6 +166,14 @@ async fn event_loop(
         let Some(msg) = msg else {
             break;
         };
+        if let Msg::Key(key) = &msg
+            && is_suspend_key(key)
+        {
+            leave_terminal();
+            suspend();
+            *terminal = enter_terminal()?;
+            continue;
+        }
         *pending = app.handle(msg);
     }
 
@@ -181,5 +211,11 @@ mod tests {
         assert!(matches!(Cli::try_parse_from(["azkv", "info"]).unwrap().command, Some(Command::Info)));
         assert!(matches!(Cli::try_parse_from(["azkv", "version"]).unwrap().command, Some(Command::Version)));
         assert!(Cli::try_parse_from(["azkv"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn only_ctrl_z_suspends() {
+        assert!(is_suspend_key(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)));
+        assert!(!is_suspend_key(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)));
     }
 }

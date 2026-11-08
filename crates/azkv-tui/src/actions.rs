@@ -19,7 +19,6 @@ fn auth_for(profile: &Profile, cache: &mut AuthCache) -> Arc<AzAuth> {
     cache.entry(profile.dir.clone()).or_insert_with(|| AzAuth::new(profile.dir.clone())).clone()
 }
 
-/// Runs one UI action: quits, copies text or spawns the matching Azure call.
 pub fn execute(
     action: Action,
     tx: &UnboundedSender<Msg>,
@@ -166,8 +165,6 @@ pub fn execute(
                 let result = async {
                     let source_client = KvVault::for_vault(&source, &auth, proxy.as_ref())?;
                     let dest_client = KvVault::for_vault(&dest, &auth, proxy.as_ref())?;
-                    // Only names matching the secret filter are planned; the
-                    // destination check still runs against that subset.
                     let names = source_client
                         .names()
                         .await?
@@ -215,7 +212,6 @@ pub fn execute(
     false
 }
 
-/// Writes a secret after checking that a create is new or an edit is still current.
 async fn save_secret(
     client: &KvVault,
     secret: &Secret,
@@ -246,7 +242,6 @@ async fn save_secret(
     if patch { Ok(client.update(secret).await?) } else { Ok(client.put(secret).await?) }
 }
 
-/// Copies a secret's value/metadata under a new name, refusing to overwrite.
 async fn duplicate_secret(client: &KvVault, source: &str, name: &str) -> Result<SecretMeta> {
     let secret = client.get(source).await?;
     match client.get(name).await {

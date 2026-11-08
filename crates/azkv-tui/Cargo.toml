@@ -1,6 +1,6 @@
 [package]
 name = "azkv-tui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [[bin]]
@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 azkv-core = { path = "../azkv-core" }
 clap = { workspace = true }
+libc = { workspace = true }
 ratatui = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
