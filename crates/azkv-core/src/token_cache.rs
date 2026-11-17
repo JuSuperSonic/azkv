@@ -11,10 +11,6 @@ use crate::error::{Error, Result};
 /// Public client used by the Azure CLI; tokens in its cache are refreshable.
 pub const CLIENT_ID: &str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 
-/// Read-only view of the Azure CLI's MSAL token cache and profile.
-///
-/// No `az` process is started: unexpired access tokens are reused, and an
-/// expired one is refreshed with the cached refresh token.
 #[derive(Clone, Debug)]
 pub struct TokenCache {
     dir: PathBuf,
